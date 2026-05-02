@@ -20,7 +20,9 @@ pub struct ComputedStatistics {
 
 pub fn compute_statistics(config: &Config, dataset: &InputDataset) -> Result<ComputedStatistics> {
     let key_frequencies = key_frequencies(dataset, &config.partitioning.key_columns);
-    let heavy_hitters =
+    let mean_key_frequency = mean_frequency(&key_frequencies);
+    let max_key_frequency = max_frequency(&key_frequencies);
+    let heavy_hitter_candidates: Vec<_> =
         heavy_hitters::detect_heavy_hitters(&key_frequencies, config.partitioning.heavy_key_alpha)
             .into_iter()
             .map(|heavy| HeavyKeyPlan {
@@ -29,6 +31,13 @@ pub fn compute_statistics(config: &Config, dataset: &InputDataset) -> Result<Com
                 salt_count: 1,
             })
             .collect();
+    let partition_sizes = base_partition_sizes(
+        dataset,
+        &config.partitioning.key_columns,
+        config.partitioning.max_partitions.get(),
+        config.partitioning.seed,
+    );
+    let skew = skew_stats(&partition_sizes);
 
     let metadata = StatsMetadata {
         version: METADATA_VERSION.to_string(),
@@ -44,23 +53,16 @@ pub fn compute_statistics(config: &Config, dataset: &InputDataset) -> Result<Com
                 .collect(),
             estimated_row_width_bytes: None,
             distinct_keys: Some(key_frequencies.len() as u64),
+            mean_key_frequency,
+            max_key_frequency,
             key_frequencies,
-            heavy_hitters,
+            heavy_hitter_candidates: heavy_hitter_candidates.clone(),
+            heavy_hitters: heavy_hitter_candidates,
         },
-        skew: skew_stats(&base_partition_sizes(
-            dataset,
-            &config.partitioning.key_columns,
-            config.partitioning.max_partitions.get(),
-            config.partitioning.seed,
-        )),
+        skew,
         estimates: PartitionEstimates {
             target_partitions: config.partitioning.max_partitions.get(),
-            before_partition_sizes: base_partition_sizes(
-                dataset,
-                &config.partitioning.key_columns,
-                config.partitioning.max_partitions.get(),
-                config.partitioning.seed,
-            ),
+            before_partition_sizes: partition_sizes,
             after_partition_sizes: vec![0; config.partitioning.max_partitions.get()],
         },
     };
@@ -78,6 +80,18 @@ fn key_frequencies(dataset: &InputDataset, key_columns: &[String]) -> BTreeMap<S
     }
 
     frequencies
+}
+
+fn mean_frequency(key_frequencies: &BTreeMap<String, u64>) -> f64 {
+    if key_frequencies.is_empty() {
+        return 0.0;
+    }
+
+    key_frequencies.values().sum::<u64>() as f64 / key_frequencies.len() as f64
+}
+
+fn max_frequency(key_frequencies: &BTreeMap<String, u64>) -> u64 {
+    key_frequencies.values().copied().max().unwrap_or(0)
 }
 
 fn base_partition_sizes(
@@ -187,6 +201,8 @@ mod tests {
 
         assert_eq!(statistics.metadata.input.total_rows, 4);
         assert_eq!(statistics.metadata.input.distinct_keys, Some(3));
+        assert_eq!(statistics.metadata.input.mean_key_frequency, 4.0 / 3.0);
+        assert_eq!(statistics.metadata.input.max_key_frequency, 2);
         assert_eq!(
             statistics.metadata.input.key_frequencies.get("user_id=a"),
             Some(&2)
@@ -206,6 +222,7 @@ mod tests {
         let statistics = compute_statistics(&config, &dataset).expect("statistics should compute");
 
         assert_eq!(statistics.metadata.input.heavy_hitters.len(), 1);
+        assert_eq!(statistics.metadata.input.heavy_hitter_candidates.len(), 1);
         assert_eq!(
             statistics.metadata.input.heavy_hitters[0].key,
             "user_id=heavy"
@@ -227,5 +244,30 @@ mod tests {
         let statistics = compute_statistics(&config, &dataset).expect("statistics should compute");
 
         assert!(statistics.metadata.input.heavy_hitters.is_empty());
+        assert!(statistics.metadata.input.heavy_hitter_candidates.is_empty());
+    }
+
+    #[test]
+    fn computes_partition_estimates_and_skew_metrics() {
+        let config = example_config();
+        let dataset = InputDataset::from_rows(Dataset::from_key_values(
+            "user_id",
+            ["a", "a", "a", "b", "b", "c", "d", "e"]
+                .into_iter()
+                .map(String::from),
+        ));
+
+        let statistics = compute_statistics(&config, &dataset).expect("statistics should compute");
+        let estimates = &statistics.metadata.estimates.before_partition_sizes;
+        let skew = &statistics.metadata.skew;
+
+        assert_eq!(statistics.metadata.estimates.target_partitions, 4);
+        assert_eq!(estimates.len(), 4);
+        assert_eq!(estimates.iter().sum::<u64>(), 8);
+        assert_eq!(skew.max_partition_size, *estimates.iter().max().unwrap());
+        assert_eq!(skew.mean_partition_size, 2.0);
+        assert!(skew.max_mean_imbalance_ratio >= 1.0);
+        assert!(skew.partition_size_variance >= 0.0);
+        assert!(skew.coefficient_of_variation >= 0.0);
     }
 }
