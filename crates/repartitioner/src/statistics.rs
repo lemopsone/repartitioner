@@ -54,9 +54,9 @@ pub fn compute_statistics(config: &Config, dataset: &InputDataset) -> Result<Com
             max_mean_imbalance_ratio: 0.0,
         },
         estimates: PartitionEstimates {
-            target_partitions: config.partitioning.max_partitions,
+            target_partitions: config.partitioning.max_partitions.get(),
             before_partition_sizes: Vec::new(),
-            after_partition_sizes: vec![0; config.partitioning.max_partitions],
+            after_partition_sizes: vec![0; config.partitioning.max_partitions.get()],
         },
     };
 
