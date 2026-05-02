@@ -24,6 +24,7 @@ fn run(args: CliArgs) -> Result<()> {
         &plan.metadata,
         &statistics.metadata,
         &assignments,
+        &dataset,
     )?;
 
     Ok(())

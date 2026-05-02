@@ -1,4 +1,8 @@
-use std::{fs, path::Path};
+use std::{fs, fs::File, path::Path, sync::Arc};
+
+use arrow_array::{ArrayRef, RecordBatch, StringArray};
+use arrow_schema::{DataType, Field, Schema};
+use parquet::arrow::ArrowWriter;
 
 use crate::{
     manifest::{
@@ -6,6 +10,7 @@ use crate::{
         METADATA_VERSION,
     },
     partitioner::PartitionAssignmentSummary,
+    reader::InputDataset,
     Error, Result,
 };
 
@@ -19,6 +24,7 @@ pub fn write_output(
     plan: &PartitionPlan,
     stats: &StatsMetadata,
     assignments: &PartitionAssignmentSummary,
+    dataset: &InputDataset,
 ) -> Result<WriteSummary> {
     let output_dir = output_dir.as_ref();
     fs::create_dir_all(output_dir).map_err(|source| Error::WriteFile {
@@ -26,21 +32,64 @@ pub fn write_output(
         source,
     })?;
 
+    let mut rows_by_partition = vec![Vec::new(); plan.output_partitions];
+    for record in &assignments.records {
+        if record.partition_id < rows_by_partition.len() {
+            rows_by_partition[record.partition_id].push(record.row_index);
+        }
+    }
+
+    let mut output_files = Vec::new();
+    for (partition_id, row_indexes) in rows_by_partition.iter().enumerate() {
+        if row_indexes.is_empty() {
+            continue;
+        }
+
+        let relative_path = format!("ap_partition={partition_id}/part-{partition_id:05}.parquet");
+        let file_path = output_dir.join(&relative_path);
+        if let Some(parent) = file_path.parent() {
+            fs::create_dir_all(parent).map_err(|source| Error::WriteFile {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+
+        write_partition_parquet(&file_path, plan, dataset, row_indexes)?;
+        let size_bytes = fs::metadata(&file_path).ok().map(|metadata| metadata.len());
+        output_files.push(OutputFile {
+            path: relative_path,
+            partition_id,
+            row_count: row_indexes.len() as u64,
+            size_bytes,
+        });
+    }
+
     let partitions = assignments
         .partition_row_counts
         .iter()
         .enumerate()
-        .map(|(partition_id, row_count)| PartitionManifest {
-            partition_id,
-            row_count: *row_count,
-            file_count: 0,
-            size_bytes: None,
+        .map(|(partition_id, row_count)| {
+            let partition_files: Vec<_> = output_files
+                .iter()
+                .filter(|file| file.partition_id == partition_id)
+                .collect();
+            let size_bytes = partition_files
+                .iter()
+                .filter_map(|file| file.size_bytes)
+                .reduce(|left, right| left + right);
+
+            PartitionManifest {
+                partition_id,
+                row_count: *row_count,
+                file_count: partition_files.len(),
+                size_bytes,
+            }
         })
         .collect();
 
     let manifest = Manifest {
         version: METADATA_VERSION.to_string(),
-        output_files: Vec::<OutputFile>::new(),
+        output_files,
         partitions,
     };
 
@@ -49,4 +98,46 @@ pub fn write_output(
     write_json_metadata(output_dir.join("_manifest.json"), &manifest)?;
 
     Ok(WriteSummary { manifest })
+}
+
+fn write_partition_parquet(
+    file_path: &Path,
+    plan: &PartitionPlan,
+    dataset: &InputDataset,
+    row_indexes: &[usize],
+) -> Result<()> {
+    let schema = Arc::new(Schema::new(
+        plan.key_columns
+            .iter()
+            .map(|column| Field::new(column, DataType::Utf8, true))
+            .collect::<Vec<_>>(),
+    ));
+    let columns = plan
+        .key_columns
+        .iter()
+        .map(|column| {
+            let values = row_indexes
+                .iter()
+                .map(|row_index| {
+                    dataset
+                        .rows
+                        .rows
+                        .get(*row_index)
+                        .and_then(|row| row.key_values().get(column))
+                        .cloned()
+                })
+                .collect::<Vec<_>>();
+            Arc::new(StringArray::from(values)) as ArrayRef
+        })
+        .collect::<Vec<_>>();
+    let batch = RecordBatch::try_new(schema.clone(), columns)?;
+    let file = File::create(file_path).map_err(|source| Error::WriteFile {
+        path: file_path.to_path_buf(),
+        source,
+    })?;
+    let mut writer = ArrowWriter::try_new(file, schema, None)?;
+    writer.write(&batch)?;
+    writer.close()?;
+
+    Ok(())
 }
