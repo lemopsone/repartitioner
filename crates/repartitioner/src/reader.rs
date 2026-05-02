@@ -23,19 +23,17 @@ pub fn read_dataset(config: &Config) -> Result<InputDataset> {
     }
 }
 
-fn inspect_local_input(input: &str, format: DatasetFormat) -> Result<InputDataset> {
-    let path = Path::new(input);
-
-    let files = if path.is_file() {
-        vec![inspect_file(path)?]
-    } else if path.is_dir() {
+fn inspect_local_input(input: &Path, format: DatasetFormat) -> Result<InputDataset> {
+    let files = if input.is_file() {
+        vec![inspect_file(input)?]
+    } else if input.is_dir() {
         let mut files = Vec::new();
-        for entry in fs::read_dir(path).map_err(|source| Error::ReadFile {
-            path: path.to_path_buf(),
+        for entry in fs::read_dir(input).map_err(|source| Error::ReadFile {
+            path: input.to_path_buf(),
             source,
         })? {
             let entry = entry.map_err(|source| Error::ReadFile {
-                path: path.to_path_buf(),
+                path: input.to_path_buf(),
                 source,
             })?;
             let entry_path = entry.path();
@@ -54,7 +52,7 @@ fn inspect_local_input(input: &str, format: DatasetFormat) -> Result<InputDatase
     };
 
     Ok(InputDataset {
-        path: input.to_string(),
+        path: input.display().to_string(),
         format,
         files,
     })

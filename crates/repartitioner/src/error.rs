@@ -26,8 +26,29 @@ pub enum Error {
     #[error("failed to serialize JSON metadata: {0}")]
     SerializeJson(#[from] serde_json::Error),
 
+    #[error("invalid config: {0}")]
+    InvalidConfig(#[from] ConfigValidationError),
+
     #[error("unsupported dataset format: {0}")]
     UnsupportedFormat(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ConfigValidationError {
+    #[error("dataset.input must not be empty")]
+    MissingInputPath,
+
+    #[error("partitioning.key_columns must contain at least one non-empty column name")]
+    MissingKeyColumns,
+
+    #[error("partitioning.target_partition_size_mb must be greater than zero, got {value}")]
+    InvalidTargetPartitionSize { value: u64 },
+
+    #[error("partitioning.max_partitions must be greater than zero, got {value}")]
+    InvalidMaxPartitionCount { value: usize },
+
+    #[error("unsupported partitioning.strategy: {value}")]
+    InvalidStrategyName { value: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

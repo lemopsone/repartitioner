@@ -1,8 +1,6 @@
 use std::process::ExitCode;
 
-use repartitioner::{
-    cli::CliArgs, partitioner, planner, reader, statistics, writer, Result,
-};
+use repartitioner::{cli::CliArgs, partitioner, planner, reader, statistics, writer, Result};
 
 fn main() -> ExitCode {
     match run(CliArgs::parse_args()) {

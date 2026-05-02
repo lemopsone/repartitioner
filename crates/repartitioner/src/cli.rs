@@ -26,12 +26,14 @@ impl CliArgs {
         let mut config = Config::from_yaml_file(&self.config)?;
 
         if let Some(input) = &self.input {
-            config.dataset.input = input.display().to_string();
+            config.dataset.input = input.clone();
         }
 
         if let Some(output) = &self.output {
-            config.dataset.output = output.display().to_string();
+            config.dataset.output = output.clone();
         }
+
+        config.validate()?;
 
         Ok(config)
     }

@@ -143,10 +143,7 @@ mod tests {
                 }],
                 estimated_row_width_bytes: Some(128),
                 distinct_keys: Some(2),
-                key_frequencies: BTreeMap::from([
-                    ("a".to_string(), 5),
-                    ("b".to_string(), 5),
-                ]),
+                key_frequencies: BTreeMap::from([("a".to_string(), 5), ("b".to_string(), 5)]),
                 heavy_hitters: Vec::new(),
             },
             skew: SkewStats {
