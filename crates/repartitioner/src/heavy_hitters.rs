@@ -27,3 +27,41 @@ pub fn detect_heavy_hitters(
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_frequent_key_in_synthetic_skew() {
+        let frequencies = BTreeMap::from([
+            ("user_id=heavy".to_string(), 20),
+            ("user_id=a".to_string(), 2),
+            ("user_id=b".to_string(), 2),
+            ("user_id=c".to_string(), 2),
+        ]);
+
+        let hitters = detect_heavy_hitters(&frequencies, 2.0);
+
+        assert_eq!(
+            hitters,
+            vec![HeavyHitter {
+                key: "user_id=heavy".to_string(),
+                frequency: 20,
+            }]
+        );
+    }
+
+    #[test]
+    fn ignores_uniform_distribution() {
+        let frequencies = BTreeMap::from([
+            ("user_id=a".to_string(), 5),
+            ("user_id=b".to_string(), 5),
+            ("user_id=c".to_string(), 5),
+        ]);
+
+        let hitters = detect_heavy_hitters(&frequencies, 2.0);
+
+        assert!(hitters.is_empty());
+    }
+}

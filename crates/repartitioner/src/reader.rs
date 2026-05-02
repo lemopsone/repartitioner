@@ -1,18 +1,30 @@
 use std::{fs, path::Path};
 
-use crate::{config::DatasetFormat, Config, Error, Result};
+use crate::{config::DatasetFormat, dataset::Dataset, Config, Error, Result};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InputDataset {
     pub path: String,
     pub format: DatasetFormat,
     pub files: Vec<InputFile>,
+    pub rows: Dataset,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InputFile {
     pub path: String,
     pub size_bytes: u64,
+}
+
+impl InputDataset {
+    pub fn from_rows(rows: Dataset) -> Self {
+        Self {
+            path: "<memory>".to_string(),
+            format: DatasetFormat::Parquet,
+            files: Vec::new(),
+            rows,
+        }
+    }
 }
 
 pub fn read_dataset(config: &Config) -> Result<InputDataset> {
@@ -55,6 +67,7 @@ fn inspect_local_input(input: &Path, format: DatasetFormat) -> Result<InputDatas
         path: input.display().to_string(),
         format,
         files,
+        rows: Dataset::empty(),
     })
 }
 
