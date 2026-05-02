@@ -13,10 +13,19 @@ pub struct PartitionPlan {
     pub strategy: PartitioningStrategy,
     pub key_columns: Vec<String>,
     pub target_partition_size_mb: u64,
+    pub target_partition_rows: u64,
     pub output_partitions: usize,
+    pub normal_keys: Vec<NormalKeyPlan>,
     pub heavy_keys: Vec<HeavyKeyPlan>,
     pub hash_function: String,
     pub seed: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NormalKeyPlan {
+    pub key: String,
+    pub estimated_frequency: u64,
+    pub partition_id: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -24,6 +33,13 @@ pub struct HeavyKeyPlan {
     pub key: String,
     pub estimated_frequency: u64,
     pub salt_count: usize,
+    pub salt_partitions: Vec<SaltPartitionPlan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SaltPartitionPlan {
+    pub salt_index: usize,
+    pub partition_id: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -119,19 +135,41 @@ mod tests {
             strategy: PartitioningStrategy::AdaptiveHashSalt,
             key_columns: vec!["user_id".to_string()],
             target_partition_size_mb: 128,
+            target_partition_rows: 250,
             output_partitions: 4,
+            normal_keys: vec![NormalKeyPlan {
+                key: "user_id=7".to_string(),
+                estimated_frequency: 10,
+                partition_id: 2,
+            }],
             heavy_keys: vec![HeavyKeyPlan {
                 key: "42".to_string(),
                 estimated_frequency: 1000,
                 salt_count: 3,
+                salt_partitions: vec![
+                    SaltPartitionPlan {
+                        salt_index: 0,
+                        partition_id: 0,
+                    },
+                    SaltPartitionPlan {
+                        salt_index: 1,
+                        partition_id: 2,
+                    },
+                    SaltPartitionPlan {
+                        salt_index: 2,
+                        partition_id: 3,
+                    },
+                ],
             }],
-            hash_function: "std-default-hasher".to_string(),
+            hash_function: "fnv1a64_seeded".to_string(),
             seed: 42,
         };
 
         let json = serde_json::to_string(&plan).expect("plan should serialize");
         assert!(json.contains("\"strategy\":\"adaptive_hash_salt\""));
+        assert!(json.contains("\"normal_keys\""));
         assert!(json.contains("\"salt_count\":3"));
+        assert!(json.contains("\"salt_partitions\""));
     }
 
     #[test]
