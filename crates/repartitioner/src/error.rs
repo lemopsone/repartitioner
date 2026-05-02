@@ -26,8 +26,17 @@ pub enum Error {
     #[error("failed to serialize JSON metadata: {0}")]
     SerializeJson(#[from] serde_json::Error),
 
+    #[error("Arrow error: {0}")]
+    Arrow(#[from] arrow_schema::ArrowError),
+
+    #[error("Parquet error: {0}")]
+    Parquet(#[from] parquet::errors::ParquetError),
+
     #[error("invalid config: {0}")]
     InvalidConfig(#[from] ConfigValidationError),
+
+    #[error("unsupported Parquet column type for {column}: {data_type}")]
+    UnsupportedColumnType { column: String, data_type: String },
 
     #[error("unsupported dataset format: {0}")]
     UnsupportedFormat(String),
