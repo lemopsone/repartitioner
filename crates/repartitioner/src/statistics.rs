@@ -29,6 +29,7 @@ pub fn compute_statistics(config: &Config, dataset: &InputDataset) -> Result<Com
                 key: heavy.key,
                 estimated_frequency: heavy.frequency,
                 salt_count: 1,
+                salt_partitions: Vec::new(),
             })
             .collect();
     let partition_sizes = base_partition_sizes(
