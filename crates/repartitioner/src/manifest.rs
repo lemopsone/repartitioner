@@ -34,13 +34,16 @@ pub struct StatsMetadata {
     pub estimates: PartitionEstimates,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InputStats {
     pub total_rows: u64,
     pub input_files: Vec<InputFileStats>,
     pub estimated_row_width_bytes: Option<u64>,
     pub distinct_keys: Option<u64>,
+    pub mean_key_frequency: f64,
+    pub max_key_frequency: u64,
     pub key_frequencies: BTreeMap<String, u64>,
+    pub heavy_hitter_candidates: Vec<HeavyKeyPlan>,
     pub heavy_hitters: Vec<HeavyKeyPlan>,
 }
 
@@ -143,7 +146,10 @@ mod tests {
                 }],
                 estimated_row_width_bytes: Some(128),
                 distinct_keys: Some(2),
+                mean_key_frequency: 5.0,
+                max_key_frequency: 5,
                 key_frequencies: BTreeMap::from([("a".to_string(), 5), ("b".to_string(), 5)]),
+                heavy_hitter_candidates: Vec::new(),
                 heavy_hitters: Vec::new(),
             },
             skew: SkewStats {
