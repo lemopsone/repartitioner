@@ -96,7 +96,7 @@ fn salt_count(frequency: u64, target_partition_rows: u64) -> usize {
     frequency.div_ceil(target_partition_rows.max(1)).max(1) as usize
 }
 
-fn hash_partition(key: &str, output_partitions: usize, seed: u64) -> usize {
+pub(crate) fn hash_partition(key: &str, output_partitions: usize, seed: u64) -> usize {
     if output_partitions == 0 {
         return 0;
     }

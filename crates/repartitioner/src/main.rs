@@ -17,7 +17,7 @@ fn run(args: CliArgs) -> Result<()> {
     let dataset = reader::read_dataset(&config)?;
     let statistics = statistics::compute_statistics(&config, &dataset)?;
     let plan = planner::build_plan(&config, &statistics)?;
-    let assignments = partitioner::assign_partitions(&plan, &statistics)?;
+    let assignments = partitioner::assign_partitions(&plan, &dataset)?;
 
     writer::write_output(
         &config.dataset.output,
