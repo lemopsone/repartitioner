@@ -77,6 +77,7 @@ fn writes_partitioned_parquet_dataset_and_reads_it_back() -> Result<()> {
 
     assert_eq!(read_back.rows.row_count(), dataset.rows.row_count());
     assert_output_schema_contains_payload_columns(&output, &write_summary.manifest.output_files);
+    assert_plan_metadata_contains_adaptive_partitioning(&output);
     assert_stats_metadata_contains_after_partition_sizes(&output);
 
     Ok(())
@@ -188,7 +189,15 @@ fn assert_stats_metadata_contains_after_partition_sizes(output: &Path) {
         .as_array()
         .expect("after partition sizes should be an array");
 
-    assert_eq!(after_sizes.len(), 4);
+    let plan_payload = std::fs::read_to_string(output.join("_partition_plan.json"))
+        .expect("plan metadata should be readable");
+    let plan_metadata: serde_json::Value =
+        serde_json::from_str(&plan_payload).expect("plan metadata should parse");
+    let output_partitions = plan_metadata["output_partitions"]
+        .as_u64()
+        .expect("output partitions should be numeric") as usize;
+
+    assert_eq!(after_sizes.len(), output_partitions);
     assert!(
         after_sizes
             .iter()
@@ -196,4 +205,17 @@ fn assert_stats_metadata_contains_after_partition_sizes(output: &Path) {
             .sum::<u64>()
             > 0
     );
+}
+
+fn assert_plan_metadata_contains_adaptive_partitioning(output: &Path) {
+    let payload = std::fs::read_to_string(output.join("_partition_plan.json"))
+        .expect("plan metadata should be readable");
+    let metadata: serde_json::Value =
+        serde_json::from_str(&payload).expect("plan metadata should parse");
+
+    assert_eq!(metadata["min_partitions"].as_u64(), Some(1));
+    assert_eq!(metadata["max_partitions"].as_u64(), Some(4));
+    assert!(metadata["required_partitions_by_size"].as_u64().is_some());
+    assert!(metadata["output_partitions"].as_u64().unwrap_or_default() <= 4);
+    assert!(metadata["feasibility"].is_object());
 }

@@ -7,7 +7,7 @@ use crate::{
         METADATA_VERSION,
     },
     reader::InputDataset,
-    Config, Result,
+    targeting, Config, Result,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -25,6 +25,12 @@ pub fn compute_statistics(config: &Config, dataset: &InputDataset) -> Result<Com
     let key_frequencies = key_frequencies(dataset, &config.partitioning.key_columns);
     let mean_key_frequency = mean_frequency(&key_frequencies);
     let max_key_frequency = max_frequency(&key_frequencies);
+    let estimated_row_width_bytes = estimated_row_width_bytes(dataset);
+    let target_partitioning = targeting::compute_target_partitioning(
+        config,
+        dataset.rows.row_count(),
+        estimated_row_width_bytes,
+    );
     let heavy_hitter_candidates: Vec<_> =
         heavy_hitters::detect_heavy_hitters(&key_frequencies, config.partitioning.heavy_key_alpha)
             .into_iter()
@@ -38,7 +44,7 @@ pub fn compute_statistics(config: &Config, dataset: &InputDataset) -> Result<Com
     let partition_sizes = base_partition_sizes(
         dataset,
         &config.partitioning.key_columns,
-        config.partitioning.max_partitions.get(),
+        target_partitioning.output_partitions,
         config.partitioning.seed,
     );
     let skew = skew_stats(&partition_sizes);
@@ -55,7 +61,7 @@ pub fn compute_statistics(config: &Config, dataset: &InputDataset) -> Result<Com
                     size_bytes: file.size_bytes,
                 })
                 .collect(),
-            estimated_row_width_bytes: estimated_row_width_bytes(dataset),
+            estimated_row_width_bytes,
             distinct_keys: Some(key_frequencies.len() as u64),
             mean_key_frequency,
             max_key_frequency,
@@ -65,9 +71,9 @@ pub fn compute_statistics(config: &Config, dataset: &InputDataset) -> Result<Com
         },
         skew,
         estimates: PartitionEstimates {
-            target_partitions: config.partitioning.max_partitions.get(),
+            target_partitions: target_partitioning.output_partitions,
             before_partition_sizes: partition_sizes,
-            after_partition_sizes: vec![0; config.partitioning.max_partitions.get()],
+            after_partition_sizes: vec![0; target_partitioning.output_partitions],
         },
     };
 
@@ -200,7 +206,12 @@ fn percentile(sorted_values: &[u64], percentile: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use crate::{dataset::Dataset, reader::InputDataset, tests::example_config};
+    use crate::{
+        config::DatasetFormat,
+        dataset::Dataset,
+        reader::{InputDataset, InputFile},
+        tests::example_config,
+    };
 
     use super::*;
 
@@ -284,6 +295,34 @@ mod tests {
         assert!(skew.max_mean_imbalance_ratio >= 1.0);
         assert!(skew.partition_size_variance >= 0.0);
         assert!(skew.coefficient_of_variation >= 0.0);
+    }
+
+    #[test]
+    fn small_dataset_uses_adaptive_partition_count_from_size_estimate() {
+        let config = example_config();
+        let dataset = InputDataset {
+            path: "<memory>".to_string(),
+            format: DatasetFormat::Parquet,
+            files: vec![InputFile {
+                path: "input.parquet".to_string(),
+                size_bytes: 1024,
+            }],
+            rows: Dataset::from_key_values(
+                "user_id",
+                ["a", "a", "b", "b", "c", "c", "d", "d"]
+                    .into_iter()
+                    .map(String::from),
+            ),
+            batches: Vec::new(),
+        };
+
+        let statistics = compute_statistics(&config, &dataset).expect("statistics should compute");
+
+        assert_eq!(statistics.metadata.estimates.target_partitions, 1);
+        assert_eq!(
+            statistics.metadata.estimates.before_partition_sizes,
+            vec![dataset.rows.row_count()]
+        );
     }
 
     #[test]

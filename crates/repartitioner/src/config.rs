@@ -57,6 +57,13 @@ impl Config {
             return Err(ConfigValidationError::MissingKeyColumns);
         }
 
+        if self.partitioning.min_partitions > self.partitioning.max_partitions {
+            return Err(ConfigValidationError::MinPartitionsGreaterThanMax {
+                min: self.partitioning.min_partitions.get(),
+                max: self.partitioning.max_partitions.get(),
+            });
+        }
+
         Ok(())
     }
 }
@@ -77,6 +84,7 @@ pub enum DatasetFormat {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PartitioningConfig {
     pub key_columns: Vec<String>,
+    pub min_partitions: NonZeroUsize,
     pub target_partition_size_mb: NonZeroU64,
     pub max_partitions: NonZeroUsize,
     pub strategy: PartitioningStrategy,
@@ -151,6 +159,7 @@ struct RawDatasetConfig {
 #[derive(Debug, Deserialize)]
 struct RawPartitioningConfig {
     key_columns: Vec<String>,
+    min_partitions: Option<usize>,
     target_partition_size_mb: u64,
     max_partitions: usize,
     strategy: String,
@@ -182,11 +191,25 @@ impl TryFrom<RawConfig> for Config {
             },
         )?;
 
+        let raw_min_partitions = raw.partitioning.min_partitions.unwrap_or(1);
+        let min_partitions = NonZeroUsize::new(raw_min_partitions).ok_or(
+            ConfigValidationError::InvalidMinPartitionCount {
+                value: raw_min_partitions,
+            },
+        )?;
+
         let max_partitions = NonZeroUsize::new(raw.partitioning.max_partitions).ok_or(
             ConfigValidationError::InvalidMaxPartitionCount {
                 value: raw.partitioning.max_partitions,
             },
         )?;
+
+        if min_partitions.get() > max_partitions.get() {
+            return Err(ConfigValidationError::MinPartitionsGreaterThanMax {
+                min: min_partitions.get(),
+                max: max_partitions.get(),
+            });
+        }
 
         let strategy = PartitioningStrategy::from_str(raw.partitioning.strategy.as_str())?;
 
@@ -198,6 +221,7 @@ impl TryFrom<RawConfig> for Config {
             },
             partitioning: PartitioningConfig {
                 key_columns: raw.partitioning.key_columns,
+                min_partitions,
                 target_partition_size_mb,
                 max_partitions,
                 strategy,
@@ -247,6 +271,7 @@ resources:
         assert_eq!(config.dataset.input, PathBuf::from("./data/input.parquet"));
         assert_eq!(config.dataset.format, DatasetFormat::Parquet);
         assert_eq!(config.partitioning.key_columns, vec!["user_id".to_string()]);
+        assert_eq!(config.partitioning.min_partitions.get(), 1);
         assert_eq!(config.partitioning.target_partition_size_mb.get(), 128);
         assert_eq!(config.partitioning.max_partitions.get(), 128);
         assert_eq!(
@@ -292,6 +317,43 @@ resources:
         assert_validation_error(
             error,
             ConfigValidationError::InvalidMaxPartitionCount { value: 0 },
+        );
+    }
+
+    #[test]
+    fn parses_optional_min_partition_count() {
+        let config = parse_replacing(
+            "max_partitions: 128",
+            "min_partitions: 2\n  max_partitions: 128",
+        )
+        .expect("config with min_partitions should parse");
+
+        assert_eq!(config.partitioning.min_partitions.get(), 2);
+    }
+
+    #[test]
+    fn rejects_invalid_min_partition_count() {
+        let error = parse_replacing(
+            "max_partitions: 128",
+            "min_partitions: 0\n  max_partitions: 128",
+        )
+        .expect_err("zero min partitions should be rejected");
+        assert_validation_error(
+            error,
+            ConfigValidationError::InvalidMinPartitionCount { value: 0 },
+        );
+    }
+
+    #[test]
+    fn rejects_min_partition_count_greater_than_max() {
+        let error = parse_replacing(
+            "max_partitions: 128",
+            "min_partitions: 129\n  max_partitions: 128",
+        )
+        .expect_err("min partitions greater than max should be rejected");
+        assert_validation_error(
+            error,
+            ConfigValidationError::MinPartitionsGreaterThanMax { min: 129, max: 128 },
         );
     }
 
