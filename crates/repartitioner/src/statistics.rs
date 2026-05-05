@@ -18,6 +18,12 @@ pub struct ComputedStatistics {
     pub metadata: StatsMetadata,
 }
 
+impl ComputedStatistics {
+    pub fn set_after_partition_sizes(&mut self, partition_sizes: Vec<u64>) {
+        self.metadata.estimates.after_partition_sizes = partition_sizes;
+    }
+}
+
 pub fn compute_statistics(config: &Config, dataset: &InputDataset) -> Result<ComputedStatistics> {
     let key_frequencies = key_frequencies(dataset, &config.partitioning.key_columns);
     let mean_key_frequency = mean_frequency(&key_frequencies);
@@ -52,7 +58,7 @@ pub fn compute_statistics(config: &Config, dataset: &InputDataset) -> Result<Com
                     size_bytes: file.size_bytes,
                 })
                 .collect(),
-            estimated_row_width_bytes: None,
+            estimated_row_width_bytes: estimated_row_width_bytes(dataset),
             distinct_keys: Some(key_frequencies.len() as u64),
             mean_key_frequency,
             max_key_frequency,
@@ -69,6 +75,24 @@ pub fn compute_statistics(config: &Config, dataset: &InputDataset) -> Result<Com
     };
 
     Ok(ComputedStatistics { metadata })
+}
+
+fn estimated_row_width_bytes(dataset: &InputDataset) -> Option<u64> {
+    let total_rows = dataset.rows.row_count();
+    if total_rows == 0 {
+        return None;
+    }
+
+    let total_size_bytes = dataset
+        .files
+        .iter()
+        .map(|file| file.size_bytes)
+        .sum::<u64>();
+    if total_size_bytes == 0 {
+        return None;
+    }
+
+    Some(total_size_bytes.div_ceil(total_rows).max(1))
 }
 
 fn key_frequencies(dataset: &InputDataset, key_columns: &[String]) -> BTreeMap<String, u64> {

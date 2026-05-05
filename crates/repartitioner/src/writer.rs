@@ -1,7 +1,8 @@
 use std::{fs, fs::File, path::Path, sync::Arc};
 
-use arrow_array::{ArrayRef, RecordBatch, StringArray};
+use arrow_array::{ArrayRef, RecordBatch, StringArray, UInt32Array};
 use arrow_schema::{DataType, Field, Schema};
+use arrow_select::take::take;
 use parquet::arrow::ArrowWriter;
 
 use crate::{
@@ -106,6 +107,10 @@ fn write_partition_parquet(
     dataset: &InputDataset,
     row_indexes: &[usize],
 ) -> Result<()> {
+    if !dataset.batches.is_empty() {
+        return write_retained_rows_parquet(file_path, dataset, row_indexes);
+    }
+
     let schema = Arc::new(Schema::new(
         plan.key_columns
             .iter()
@@ -140,4 +145,73 @@ fn write_partition_parquet(
     writer.close()?;
 
     Ok(())
+}
+
+fn write_retained_rows_parquet(
+    file_path: &Path,
+    dataset: &InputDataset,
+    row_indexes: &[usize],
+) -> Result<()> {
+    let schema = dataset.batches[0].schema();
+    let file = File::create(file_path).map_err(|source| Error::WriteFile {
+        path: file_path.to_path_buf(),
+        source,
+    })?;
+    let mut writer = ArrowWriter::try_new(file, schema.clone(), None)?;
+
+    for batch in retained_partition_batches(dataset, row_indexes)? {
+        writer.write(&batch)?;
+    }
+    writer.close()?;
+
+    Ok(())
+}
+
+fn retained_partition_batches(
+    dataset: &InputDataset,
+    row_indexes: &[usize],
+) -> Result<Vec<RecordBatch>> {
+    let mut result = Vec::new();
+    let mut batch_start = 0_usize;
+    let mut row_cursor = 0_usize;
+
+    for batch in &dataset.batches {
+        let batch_end = batch_start + batch.num_rows();
+        if row_cursor < row_indexes.len() && row_indexes[row_cursor] < batch_start {
+            return Err(Error::MissingRetainedRow {
+                row_index: row_indexes[row_cursor],
+            });
+        }
+
+        let mut local_indexes = Vec::new();
+        while row_cursor < row_indexes.len() && row_indexes[row_cursor] < batch_end {
+            local_indexes.push((row_indexes[row_cursor] - batch_start) as u32);
+            row_cursor += 1;
+        }
+
+        if !local_indexes.is_empty() {
+            result.push(take_batch(batch, &local_indexes)?);
+        }
+
+        batch_start = batch_end;
+    }
+
+    if let Some(row_index) = row_indexes.get(row_cursor) {
+        return Err(Error::MissingRetainedRow {
+            row_index: *row_index,
+        });
+    }
+
+    Ok(result)
+}
+
+fn take_batch(batch: &RecordBatch, local_indexes: &[u32]) -> Result<RecordBatch> {
+    let indexes = UInt32Array::from(local_indexes.to_vec());
+    let columns = batch
+        .columns()
+        .iter()
+        .map(|column| take(column.as_ref(), &indexes, None))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    Ok(RecordBatch::try_new(batch.schema(), columns)?)
 }

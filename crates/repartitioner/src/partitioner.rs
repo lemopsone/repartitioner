@@ -166,9 +166,7 @@ mod tests {
         let config = example_config();
         let dataset = InputDataset::from_rows(Dataset::from_key_values(
             "user_id",
-            std::iter::repeat("heavy")
-                .take(40)
-                .chain(["a", "b", "c", "d", "e", "f", "g", "h"]),
+            std::iter::repeat_n("heavy", 40).chain(["a", "b", "c", "d", "e", "f", "g", "h"]),
         ));
         let statistics = compute_statistics(&config, &dataset).expect("statistics should compute");
         let plan = build_plan(&config, &statistics).expect("plan should build");
