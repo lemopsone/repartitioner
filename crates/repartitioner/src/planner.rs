@@ -4,9 +4,12 @@ use std::{
 };
 
 use crate::{
-    manifest::{HeavyKeyPlan, NormalKeyPlan, PartitionPlan, SaltPartitionPlan, METADATA_VERSION},
+    manifest::{
+        HeavyKeyPlan, NormalKeyPlan, PartitionPlan, PartitionPlanFeasibility, SaltPartitionPlan,
+        METADATA_VERSION,
+    },
     statistics::ComputedStatistics,
-    Config, Result,
+    targeting, Config, Result,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -15,8 +18,13 @@ pub struct Plan {
 }
 
 pub fn build_plan(config: &Config, statistics: &ComputedStatistics) -> Result<Plan> {
-    let output_partitions = config.partitioning.max_partitions.get();
-    let target_partition_rows = target_partition_rows(config, statistics, output_partitions);
+    let target_partitioning = targeting::compute_target_partitioning(
+        config,
+        statistics.metadata.input.total_rows,
+        statistics.metadata.input.estimated_row_width_bytes,
+    );
+    let output_partitions = target_partitioning.output_partitions;
+    let target_partition_rows = target_partitioning.target_partition_rows;
     let heavy_key_names: BTreeSet<_> = statistics
         .metadata
         .input
@@ -83,40 +91,22 @@ pub fn build_plan(config: &Config, statistics: &ComputedStatistics) -> Result<Pl
             created_at: creation_timestamp(),
             strategy: config.partitioning.strategy.clone(),
             key_columns: config.partitioning.key_columns.clone(),
+            min_partitions: config.partitioning.min_partitions.get(),
+            max_partitions: config.partitioning.max_partitions.get(),
             target_partition_size_mb: config.partitioning.target_partition_size_mb.get(),
+            required_partitions_by_size: target_partitioning.required_partitions_by_size,
             target_partition_rows,
             output_partitions,
+            feasibility: PartitionPlanFeasibility {
+                target_partition_size_satisfied: target_partitioning.target_size_satisfied,
+                reason: target_partitioning.reason,
+            },
             normal_keys,
             heavy_keys,
             hash_function: "fnv1a64_seeded".to_string(),
             seed: config.partitioning.seed,
         },
     })
-}
-
-fn target_partition_rows(
-    config: &Config,
-    statistics: &ComputedStatistics,
-    output_partitions: usize,
-) -> u64 {
-    let total_rows = statistics.metadata.input.total_rows;
-    if total_rows == 0 || output_partitions == 0 {
-        return 1;
-    }
-
-    let rows_per_output_partition = total_rows.div_ceil(output_partitions as u64).max(1);
-    let Some(row_width_bytes) = statistics.metadata.input.estimated_row_width_bytes else {
-        return rows_per_output_partition;
-    };
-
-    let target_size_bytes = config
-        .partitioning
-        .target_partition_size_mb
-        .get()
-        .saturating_mul(1024 * 1024);
-    let rows_per_target_size = (target_size_bytes / row_width_bytes.max(1)).max(1);
-
-    rows_per_output_partition.min(rows_per_target_size).max(1)
 }
 
 fn salt_count(frequency: u64, target_partition_rows: u64) -> usize {
@@ -193,8 +183,8 @@ fn creation_timestamp() -> String {
 #[cfg(test)]
 mod tests {
     use crate::{
-        dataset::Dataset, reader::InputDataset, statistics::compute_statistics,
-        tests::example_config,
+        dataset::Dataset, reader::InputDataset, statistics::compute_statistics, targeting,
+        tests::example_config, Config,
     };
 
     use super::*;
@@ -271,6 +261,51 @@ mod tests {
     }
 
     #[test]
+    fn small_dataset_does_not_use_max_partitions_when_one_partition_is_enough() {
+        let config = config_with_partition_limits(1, 128, 128);
+        let dataset = InputDataset::from_rows(Dataset::from_key_values(
+            "user_id",
+            ["a", "a", "b", "b", "c", "c", "d", "d"]
+                .into_iter()
+                .map(String::from),
+        ));
+        let mut statistics =
+            compute_statistics(&config, &dataset).expect("statistics should compute");
+        statistics.metadata.input.estimated_row_width_bytes = Some(1024);
+
+        let plan = build_plan(&config, &statistics).expect("plan should build");
+
+        assert_eq!(plan.metadata.min_partitions, 1);
+        assert_eq!(plan.metadata.max_partitions, 128);
+        assert_eq!(plan.metadata.required_partitions_by_size, 1);
+        assert_eq!(plan.metadata.output_partitions, 1);
+        assert!(plan.metadata.feasibility.target_partition_size_satisfied);
+        assert_eq!(plan.metadata.feasibility.reason, None);
+    }
+
+    #[test]
+    fn large_dataset_is_capped_by_max_partitions() {
+        let config = config_with_partition_limits(1, 4, 1);
+        let dataset = InputDataset::from_rows(Dataset::from_key_values(
+            "user_id",
+            (0..10).map(|index| format!("key_{index}")),
+        ));
+        let mut statistics =
+            compute_statistics(&config, &dataset).expect("statistics should compute");
+        statistics.metadata.input.estimated_row_width_bytes = Some(1024 * 1024);
+
+        let plan = build_plan(&config, &statistics).expect("plan should build");
+
+        assert_eq!(plan.metadata.required_partitions_by_size, 10);
+        assert_eq!(plan.metadata.output_partitions, 4);
+        assert!(!plan.metadata.feasibility.target_partition_size_satisfied);
+        assert_eq!(
+            plan.metadata.feasibility.reason.as_deref(),
+            Some(targeting::REASON_REQUIRED_PARTITIONS_EXCEED_MAX)
+        );
+    }
+
+    #[test]
     fn assigns_normal_keys_to_deterministic_hash_partitions() {
         let config = example_config();
         let dataset = InputDataset::from_rows(Dataset::from_key_values(
@@ -311,5 +346,40 @@ mod tests {
         assert!(json.contains("\"normal_keys\""));
         assert!(json.contains("\"salt_partitions\""));
         assert!(json.contains("\"target_partition_rows\":4"));
+        assert!(json.contains("\"required_partitions_by_size\""));
+        assert!(json.contains("\"feasibility\""));
+    }
+
+    fn config_with_partition_limits(
+        min_partitions: usize,
+        max_partitions: usize,
+        target_partition_size_mb: u64,
+    ) -> Config {
+        Config::from_yaml_str(&format!(
+            r#"
+dataset:
+  input: "./data/input.parquet"
+  output: "./data/output_partitioned"
+  format: "parquet"
+
+partitioning:
+  key_columns: ["user_id"]
+  min_partitions: {min_partitions}
+  target_partition_size_mb: {target_partition_size_mb}
+  max_partitions: {max_partitions}
+  strategy: "adaptive_hash_salt"
+  heavy_key_alpha: 2.0
+  seed: 42
+
+job:
+  type: "group_by"
+  downstream_engine: "spark"
+
+resources:
+  local_threads: 8
+  memory_limit_mb: 4096
+"#
+        ))
+        .expect("test config should parse")
     }
 }

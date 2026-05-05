@@ -62,8 +62,16 @@ pub enum ConfigValidationError {
     #[error("partitioning.target_partition_size_mb must be greater than zero, got {value}")]
     InvalidTargetPartitionSize { value: u64 },
 
+    #[error("partitioning.min_partitions must be greater than zero, got {value}")]
+    InvalidMinPartitionCount { value: usize },
+
     #[error("partitioning.max_partitions must be greater than zero, got {value}")]
     InvalidMaxPartitionCount { value: usize },
+
+    #[error(
+        "partitioning.min_partitions must not be greater than partitioning.max_partitions, got {min} > {max}"
+    )]
+    MinPartitionsGreaterThanMax { min: usize, max: usize },
 
     #[error("unsupported partitioning.strategy: {value}")]
     InvalidStrategyName { value: String },

@@ -8,6 +8,7 @@ pub mod partitioner;
 pub mod planner;
 pub mod reader;
 pub mod statistics;
+pub mod targeting;
 pub mod writer;
 
 pub use config::Config;

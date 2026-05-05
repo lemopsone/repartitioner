@@ -12,13 +12,23 @@ pub struct PartitionPlan {
     pub created_at: String,
     pub strategy: PartitioningStrategy,
     pub key_columns: Vec<String>,
+    pub min_partitions: usize,
+    pub max_partitions: usize,
     pub target_partition_size_mb: u64,
+    pub required_partitions_by_size: usize,
     pub target_partition_rows: u64,
     pub output_partitions: usize,
+    pub feasibility: PartitionPlanFeasibility,
     pub normal_keys: Vec<NormalKeyPlan>,
     pub heavy_keys: Vec<HeavyKeyPlan>,
     pub hash_function: String,
     pub seed: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartitionPlanFeasibility {
+    pub target_partition_size_satisfied: bool,
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -134,9 +144,16 @@ mod tests {
             created_at: "2026-05-02T00:00:00Z".to_string(),
             strategy: PartitioningStrategy::AdaptiveHashSalt,
             key_columns: vec!["user_id".to_string()],
+            min_partitions: 1,
+            max_partitions: 4,
             target_partition_size_mb: 128,
+            required_partitions_by_size: 4,
             target_partition_rows: 250,
             output_partitions: 4,
+            feasibility: PartitionPlanFeasibility {
+                target_partition_size_satisfied: true,
+                reason: None,
+            },
             normal_keys: vec![NormalKeyPlan {
                 key: "user_id=7".to_string(),
                 estimated_frequency: 10,
