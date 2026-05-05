@@ -1,10 +1,7 @@
-use std::{
-    collections::{hash_map::DefaultHasher, BTreeMap},
-    hash::{Hash, Hasher},
-};
+use std::collections::BTreeMap;
 
 use crate::{
-    heavy_hitters,
+    hashing, heavy_hitters,
     manifest::{
         HeavyKeyPlan, InputFileStats, InputStats, PartitionEstimates, SkewStats, StatsMetadata,
         METADATA_VERSION,
@@ -139,19 +136,12 @@ fn base_partition_sizes(
 
     for row in &dataset.rows.rows {
         if let Some(key) = row.partition_key(key_columns) {
-            let partition_id = stable_partition(&key, partition_count, seed);
+            let partition_id = hashing::partition_id(&key, partition_count, seed);
             sizes[partition_id] += 1;
         }
     }
 
     sizes
-}
-
-fn stable_partition(key: &str, partition_count: usize, seed: u64) -> usize {
-    let mut hasher = DefaultHasher::new();
-    seed.hash(&mut hasher);
-    key.hash(&mut hasher);
-    (hasher.finish() as usize) % partition_count
 }
 
 fn skew_stats(partition_sizes: &[u64]) -> SkewStats {
@@ -332,6 +322,30 @@ mod tests {
         assert_eq!(
             statistics.metadata.estimates.before_partition_sizes,
             vec![dataset.rows.row_count()]
+        );
+    }
+
+    #[test]
+    fn before_partition_sizes_sum_to_row_count_for_uniform_data() {
+        let config = example_config();
+        let dataset = InputDataset::from_rows(Dataset::from_key_values(
+            "user_id",
+            ["a", "a", "b", "b", "c", "c", "d", "d"]
+                .into_iter()
+                .map(String::from),
+        ));
+
+        let statistics = compute_statistics(&config, &dataset).expect("statistics should compute");
+
+        assert!(statistics.metadata.input.heavy_hitters.is_empty());
+        assert_eq!(
+            statistics
+                .metadata
+                .estimates
+                .before_partition_sizes
+                .iter()
+                .sum::<u64>(),
+            dataset.rows.row_count()
         );
     }
 }
