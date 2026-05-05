@@ -1,12 +1,14 @@
-# Experiment Scripts
+# Набор скриптов для проведения исследования
 
-Install Python dependency:
+Для использования необходимо установить зависимости
 
 ```bash
 pip install pyarrow
+# или
+pip install -r experiments/requirements.txt
 ```
 
-Generate datasets:
+Генерация датасетов:
 
 ```bash
 python3 experiments/generate_uniform.py --output data/uniform.parquet --rows 100000
@@ -15,7 +17,7 @@ python3 experiments/generate_multi_heavy_key.py --output data/multi-heavy.parque
 python3 experiments/generate_zipf.py --output data/zipf.parquet --rows 100000 --zipf-exponent 1.2
 ```
 
-Run the Rust preprocessor and collect one result JSON:
+Запуск core-метода через Python-обертку с генерацией отчета:
 
 ```bash
 python3 experiments/run_preprocessor.py \
@@ -25,7 +27,7 @@ python3 experiments/run_preprocessor.py \
   --max-partitions 16
 ```
 
-Collect results again from an existing output dataset:
+Сборка метаданных и результатов с полученного перераспределения:
 
 ```bash
 python3 experiments/collect_results.py \

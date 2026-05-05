@@ -1,14 +1,15 @@
-# Spark Benchmark Scripts
+# Spark Benchmark
 
-These scripts are only for downstream integration and benchmarking. They are not used by the Rust core.
+Скрипты для прогона тестовых spark-pipeline'ов с целью исследования эффективности работы
+разрабатываемого метода.
 
-Install Spark Python dependencies in your experiment environment:
+Установка зависимостей:
 
 ```bash
 pip install -r spark_pipeline/requirements.txt
 ```
 
-Run both workloads:
+Два прогона (JOIN + groupBy):
 
 ```bash
 python3 spark_pipeline/benchmark.py \
@@ -19,7 +20,7 @@ python3 spark_pipeline/benchmark.py \
   --shuffle-partitions 16
 ```
 
-Run only groupBy:
+Только groupBy:
 
 ```bash
 python3 spark_pipeline/run_groupby.py \
@@ -29,7 +30,7 @@ python3 spark_pipeline/run_groupby.py \
   --csv-report reports/groupby-heavy.csv
 ```
 
-Run only join:
+Только JOIN:
 
 ```bash
 python3 spark_pipeline/run_join.py \
@@ -40,4 +41,5 @@ python3 spark_pipeline/run_join.py \
   --csv-report reports/join-heavy.csv
 ```
 
-If `--join-right` is omitted, the script builds a cached right side from distinct keys in the original dataset before timed join runs. Reports include downstream Spark time only for the timed groupBy/join action.
+Если не указывать флаг `--join-right`, скрипт собирает правую часть из оригинального датасета
+до начала замеров времени. Эти действия не попадают в генерируемые отчеты.
