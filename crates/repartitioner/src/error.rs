@@ -38,6 +38,15 @@ pub enum Error {
     #[error("unsupported Parquet column type for {column}: {data_type}")]
     UnsupportedColumnType { column: String, data_type: String },
 
+    #[error("input path does not exist or is not accessible: {path}")]
+    InputPathNotFound { path: PathBuf },
+
+    #[error("no Parquet files found under input path: {path}")]
+    NoParquetFiles { path: PathBuf },
+
+    #[error("input row {row_index} is not available in retained record batches")]
+    MissingRetainedRow { row_index: usize },
+
     #[error("unsupported dataset format: {0}")]
     UnsupportedFormat(String),
 }

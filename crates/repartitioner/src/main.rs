@@ -15,9 +15,10 @@ fn main() -> ExitCode {
 fn run(args: CliArgs) -> Result<()> {
     let config = args.load_config()?;
     let dataset = reader::read_dataset(&config)?;
-    let statistics = statistics::compute_statistics(&config, &dataset)?;
+    let mut statistics = statistics::compute_statistics(&config, &dataset)?;
     let plan = planner::build_plan(&config, &statistics)?;
     let assignments = partitioner::assign_partitions(&plan, &dataset)?;
+    statistics.set_after_partition_sizes(assignments.partition_row_counts.clone());
 
     writer::write_output(
         &config.dataset.output,

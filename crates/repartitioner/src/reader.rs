@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, fs, fs::File, path::Path};
 
-use arrow_array::{Array, LargeStringArray, StringArray};
+use arrow_array::{Array, LargeStringArray, RecordBatch, StringArray};
 use arrow_schema::DataType;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
@@ -10,12 +10,13 @@ use crate::{
     Config, Error, Result,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct InputDataset {
     pub path: String,
     pub format: DatasetFormat,
     pub files: Vec<InputFile>,
     pub rows: Dataset,
+    pub batches: Vec<RecordBatch>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,6 +32,7 @@ impl InputDataset {
             format: DatasetFormat::Parquet,
             files: Vec::new(),
             rows,
+            batches: Vec::new(),
         }
     }
 }
@@ -58,15 +60,24 @@ fn inspect_local_input(
         files.sort_by(|left, right| left.path.cmp(&right.path));
         files
     } else {
-        Vec::new()
+        return Err(Error::InputPathNotFound {
+            path: input.to_path_buf(),
+        });
     };
-    let rows = read_parquet_rows(&files, key_columns)?;
+    if files.is_empty() {
+        return Err(Error::NoParquetFiles {
+            path: input.to_path_buf(),
+        });
+    }
+
+    let (rows, batches) = read_parquet_dataset(&files, key_columns)?;
 
     Ok(InputDataset {
         path: input.display().to_string(),
         format,
         files,
         rows,
+        batches,
     })
 }
 
@@ -85,7 +96,7 @@ fn collect_parquet_files(dir: &Path, files: &mut Vec<InputFile>) -> Result<()> {
         } else if entry_path.is_file()
             && entry_path
                 .extension()
-                .map_or(false, |ext| ext == std::ffi::OsStr::new("parquet"))
+                .is_some_and(|ext| ext == std::ffi::OsStr::new("parquet"))
         {
             files.push(inspect_file(&entry_path)?);
         }
@@ -106,8 +117,12 @@ fn inspect_file(path: &Path) -> Result<InputFile> {
     })
 }
 
-fn read_parquet_rows(files: &[InputFile], key_columns: &[String]) -> Result<Dataset> {
+fn read_parquet_dataset(
+    files: &[InputFile],
+    key_columns: &[String],
+) -> Result<(Dataset, Vec<RecordBatch>)> {
     let mut rows = Vec::new();
+    let mut batches = Vec::new();
 
     for input_file in files {
         let file = File::open(&input_file.path).map_err(|source| Error::ReadFile {
@@ -134,10 +149,11 @@ fn read_parquet_rows(files: &[InputFile], key_columns: &[String]) -> Result<Data
                 }
                 rows.push(Row::new(key_values));
             }
+            batches.push(batch);
         }
     }
 
-    Ok(Dataset::new(rows))
+    Ok((Dataset::new(rows), batches))
 }
 
 fn string_value(column: &str, array: &dyn Array, row_index: usize) -> Result<String> {
