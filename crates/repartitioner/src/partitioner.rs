@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::{planner, planner::Plan, reader::InputDataset, Result};
+use crate::{hashing, planner::Plan, reader::InputDataset, Result};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PartitionAssignmentSummary {
@@ -39,7 +39,7 @@ pub fn assign_partitions(
                             .get(&salt_index)
                             .copied()
                             .unwrap_or_else(|| {
-                                planner::hash_partition(
+                                hashing::partition_id(
                                     key,
                                     plan.metadata.output_partitions,
                                     plan.metadata.seed,
@@ -49,7 +49,7 @@ pub fn assign_partitions(
                 }
                 None => {
                     let partition_id = normal_partitions.get(key).copied().unwrap_or_else(|| {
-                        planner::hash_partition(
+                        hashing::partition_id(
                             key,
                             plan.metadata.output_partitions,
                             plan.metadata.seed,
@@ -59,7 +59,7 @@ pub fn assign_partitions(
                 }
             },
             None => (
-                planner::hash_partition(
+                hashing::partition_id(
                     "<missing_partition_key>",
                     plan.metadata.output_partitions,
                     plan.metadata.seed,

@@ -4,6 +4,7 @@ use std::{
 };
 
 use crate::{
+    hashing,
     manifest::{HeavyKeyPlan, NormalKeyPlan, PartitionPlan, SaltPartitionPlan, METADATA_VERSION},
     statistics::ComputedStatistics,
     Config, Result,
@@ -33,7 +34,8 @@ pub fn build_plan(config: &Config, statistics: &ComputedStatistics) -> Result<Pl
         .iter()
         .filter(|(key, _)| !heavy_key_names.contains(key.as_str()))
         .map(|(key, frequency)| {
-            let partition_id = hash_partition(key, output_partitions, config.partitioning.seed);
+            let partition_id =
+                hashing::partition_id(key, output_partitions, config.partitioning.seed);
             if let Some(load) = estimated_partition_loads.get_mut(partition_id) {
                 *load += *frequency;
             }
@@ -88,7 +90,7 @@ pub fn build_plan(config: &Config, statistics: &ComputedStatistics) -> Result<Pl
             output_partitions,
             normal_keys,
             heavy_keys,
-            hash_function: "fnv1a64_seeded".to_string(),
+            hash_function: hashing::HASH_FUNCTION_NAME.to_string(),
             seed: config.partitioning.seed,
         },
     })
@@ -123,14 +125,6 @@ fn salt_count(frequency: u64, target_partition_rows: u64) -> usize {
     frequency.div_ceil(target_partition_rows.max(1)).max(1) as usize
 }
 
-pub(crate) fn hash_partition(key: &str, output_partitions: usize, seed: u64) -> usize {
-    if output_partitions == 0 {
-        return 0;
-    }
-
-    (fnv1a64_seeded(seed, key.as_bytes()) as usize) % output_partitions
-}
-
 fn least_loaded_salt_partition(
     key: &str,
     salt_index: usize,
@@ -157,7 +151,7 @@ fn least_loaded_salt_partition(
 
 fn salt_candidate_rank(key: &str, salt_index: usize, candidate: usize, seed: u64) -> u64 {
     let candidate_key = format!("{key}|salt={salt_index}|candidate={candidate}");
-    fnv1a64_seeded(seed, candidate_key.as_bytes())
+    hashing::hash_key(seed, &candidate_key)
 }
 
 fn estimated_salt_load(frequency: u64, salt_count: usize, salt_index: usize) -> u64 {
@@ -168,17 +162,6 @@ fn estimated_salt_load(frequency: u64, salt_count: usize, salt_index: usize) -> 
     let base = frequency / salt_count as u64;
     let remainder = frequency % salt_count as u64;
     base + u64::from((salt_index as u64) < remainder)
-}
-
-fn fnv1a64_seeded(seed: u64, bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf29ce484222325_u64 ^ seed;
-
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-
-    hash
 }
 
 fn creation_timestamp() -> String {
@@ -288,7 +271,35 @@ mod tests {
             first_plan.metadata.normal_keys,
             second_plan.metadata.normal_keys
         );
-        assert_eq!(first_plan.metadata.hash_function, "fnv1a64_seeded");
+        assert_eq!(
+            first_plan.metadata.hash_function,
+            hashing::HASH_FUNCTION_NAME
+        );
+    }
+
+    #[test]
+    fn statistics_before_estimates_use_same_hash_function_as_planner() {
+        let config = example_config();
+        let dataset = InputDataset::from_rows(Dataset::from_key_values(
+            "user_id",
+            ["a", "a", "b", "b", "c", "c", "d", "d"]
+                .into_iter()
+                .map(String::from),
+        ));
+        let statistics = compute_statistics(&config, &dataset).expect("statistics should compute");
+        let plan = build_plan(&config, &statistics).expect("plan should build");
+
+        assert!(plan.metadata.heavy_keys.is_empty());
+
+        let mut planned_sizes = vec![0_u64; plan.metadata.output_partitions];
+        for key in &plan.metadata.normal_keys {
+            planned_sizes[key.partition_id] += key.estimated_frequency;
+        }
+
+        assert_eq!(
+            statistics.metadata.estimates.before_partition_sizes,
+            planned_sizes
+        );
     }
 
     #[test]
