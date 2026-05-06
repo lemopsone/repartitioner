@@ -24,6 +24,11 @@ def main() -> None:
     parser.add_argument("--heavy-key-alpha", type=float, default=2.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
+        "--force-rewrite",
+        action="store_true",
+        help="Force materialized rewrite even when the planner would choose no-op.",
+    )
+    parser.add_argument(
         "--release",
         action="store_true",
         help="Run cargo with --release for timing-oriented experiments.",
@@ -45,6 +50,7 @@ def main() -> None:
         max_partitions=args.max_partitions,
         heavy_key_alpha=args.heavy_key_alpha,
         seed=args.seed,
+        force_rewrite=args.force_rewrite,
     )
 
     command = ["cargo", "run", "-p", "repartitioner"]
@@ -108,8 +114,10 @@ def write_config(
     max_partitions: int,
     heavy_key_alpha: float,
     seed: int,
+    force_rewrite: bool = False,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    force_rewrite_line = "  force_rewrite: true\n" if force_rewrite else ""
     path.write_text(
         f"""dataset:
   input: "{input_path}"
@@ -123,6 +131,7 @@ partitioning:
   strategy: "adaptive_hash_salt"
   heavy_key_alpha: {heavy_key_alpha}
   seed: {seed}
+{force_rewrite_line}
 
 job:
   type: "group_by"

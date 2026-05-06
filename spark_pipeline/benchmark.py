@@ -80,9 +80,12 @@ def run_from_args(args: argparse.Namespace, workload_override: str | None = None
     try:
         workload = workload_override or args.workload
         workloads = ["group_by", "join"] if workload == "all" else [workload]
-        original = spark.read.parquet(str(args.original))
-        preprocessed = spark.read.parquet(str(args.preprocessed))
         partition_plan = read_partition_plan(args.preprocessed)
+        manifest = read_manifest(args.preprocessed)
+        preprocessed_data_path = resolve_preprocessed_data_path(args.preprocessed, manifest)
+        input_reused = bool(manifest.get("input_reused", False)) if manifest else False
+        original = spark.read.parquet(str(args.original))
+        preprocessed = spark.read.parquet(str(preprocessed_data_path))
         right = prepare_join_right(spark, original, args.join_right, args.key_column)
 
         results: list[BenchmarkResult] = []
@@ -97,8 +100,8 @@ def run_from_args(args: argparse.Namespace, workload_override: str | None = None
                         preprocessed_path=args.preprocessed,
                         key_column=args.key_column,
                         partition_plan=partition_plan,
-                        include_method_aware=args.include_method_aware
-                        or partition_plan is not None,
+                        include_method_aware=(args.include_method_aware or partition_plan is not None)
+                        and not input_reused,
                         warmup=args.warmup,
                     )
                 )
@@ -336,6 +339,19 @@ def read_partition_plan(preprocessed_path: Path) -> dict | None:
     if not plan_path.is_file():
         return None
     return json.loads(plan_path.read_text(encoding="utf-8"))
+
+
+def read_manifest(preprocessed_path: Path) -> dict | None:
+    manifest_path = preprocessed_path / "_manifest.json"
+    if not manifest_path.is_file():
+        return None
+    return json.loads(manifest_path.read_text(encoding="utf-8"))
+
+
+def resolve_preprocessed_data_path(preprocessed_path: Path, manifest: dict | None) -> Path:
+    if manifest and manifest.get("input_reused") and manifest.get("dataset_location"):
+        return Path(manifest["dataset_location"])
+    return preprocessed_path
 
 
 def resolve_method_aware_partition_column(
