@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, fs, path::Path};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    config::{DownstreamEngine, JobType, PartitioningStrategy},
+    config::{DownstreamEngine, JobType, NormalKeyAssignment, PartitioningStrategy},
     Error, Result,
 };
 
@@ -27,6 +27,7 @@ pub struct PartitionPlan {
     pub required_partitions_by_size: usize,
     pub feasibility: PartitionPlanFeasibility,
     pub technical_columns: TechnicalColumns,
+    pub normal_key_assignment: NormalKeyAssignment,
     pub normal_keys: Vec<NormalKeyPlan>,
     pub heavy_keys: Vec<HeavyKeyPlan>,
     pub recommended_downstream_plan: RecommendedDownstreamPlan,
@@ -313,6 +314,7 @@ mod tests {
                 salt_column: "_rp_salt".to_string(),
                 heavy_key_column: "_rp_is_heavy_key".to_string(),
             },
+            normal_key_assignment: NormalKeyAssignment::LoadAware,
             normal_keys: vec![NormalKeyPlan {
                 key: "user_id=7".to_string(),
                 estimated_frequency: 10,

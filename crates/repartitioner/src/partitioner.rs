@@ -112,8 +112,14 @@ fn heavy_partition_lookup(plan: &Plan) -> BTreeMap<&str, BTreeMap<usize, usize>>
 #[cfg(test)]
 mod tests {
     use crate::{
-        dataset::Dataset, planner::build_plan, reader::InputDataset,
-        statistics::compute_statistics, tests::example_config,
+        dataset::{Dataset, Row},
+        hashing,
+        key_encoding::KeyValue,
+        planner::build_plan,
+        reader::InputDataset,
+        statistics::compute_statistics,
+        tests::example_config,
+        Config,
     };
 
     use super::*;
@@ -179,6 +185,33 @@ mod tests {
         assert!(after_ratio < before_ratio);
     }
 
+    #[test]
+    fn partitioner_uses_normal_key_plan_not_hash_fallback() {
+        let config = config_with_load_aware_normal_keys();
+        let values = normal_key_values_for_hash_partition(0, 12);
+        let dataset = InputDataset::from_rows(Dataset::from_key_values("user_id", values));
+        let statistics = compute_statistics(&config, &dataset).expect("statistics should compute");
+        let plan = build_plan(&config, &statistics).expect("plan should build");
+
+        let assignments = assign_partitions(&plan, &dataset).expect("assignment should work");
+        let normal_lookup = normal_partition_lookup(&plan);
+
+        assert!(plan.metadata.normal_keys.iter().any(|normal| {
+            normal.partition_id
+                != hashing::partition_id(
+                    &normal.key,
+                    plan.metadata.output_partitions,
+                    plan.metadata.seed,
+                )
+        }));
+        assert!(assignments.records.iter().all(|record| {
+            let Some(key) = record.key.as_deref() else {
+                return false;
+            };
+            normal_lookup.get(key).copied() == Some(record.partition_id)
+        }));
+    }
+
     fn max_mean_imbalance_ratio(partition_sizes: &[u64]) -> f64 {
         if partition_sizes.is_empty() {
             return 0.0;
@@ -190,5 +223,51 @@ mod tests {
         }
 
         *partition_sizes.iter().max().unwrap_or(&0) as f64 / mean
+    }
+
+    fn config_with_load_aware_normal_keys() -> Config {
+        Config::from_yaml_str(
+            r#"
+dataset:
+  input: "./data/input.parquet"
+  output: "./data/output_partitioned"
+  format: "parquet"
+
+partitioning:
+  key_columns: ["user_id"]
+  target_partition_size_mb: 128
+  max_partitions: 4
+  strategy: "adaptive_hash_salt"
+  normal_key_assignment: "load_aware"
+  heavy_key_alpha: 2.0
+  seed: 42
+
+job:
+  type: "group_by"
+  downstream_engine: "spark"
+
+resources:
+  local_threads: 8
+  memory_limit_mb: 4096
+"#,
+        )
+        .expect("test config should parse")
+    }
+
+    fn normal_key_values_for_hash_partition(partition_id: usize, count: usize) -> Vec<String> {
+        let mut values = Vec::new();
+        let mut candidate = 0;
+        while values.len() < count {
+            let value = format!("normal_{candidate}");
+            let row = Row::from_key_value("user_id", KeyValue::Utf8(value.clone()));
+            let key = row
+                .partition_key(&["user_id".to_string()])
+                .expect("row should have partition key");
+            if hashing::partition_id(&key, 4, 42) == partition_id {
+                values.push(value);
+            }
+            candidate += 1;
+        }
+        values
     }
 }

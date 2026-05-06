@@ -4,7 +4,7 @@ use std::{
 };
 
 use crate::{
-    config::JobType,
+    config::{JobType, NormalKeyAssignment},
     hashing, heavy_hitters,
     manifest::{
         CostEstimate, HeavyKeyPlan, JoinPlan, NormalKeyPlan, PartitionPlan,
@@ -40,26 +40,38 @@ pub fn build_plan(config: &Config, statistics: &ComputedStatistics) -> Result<Pl
     let structured_keys = structured_key_map(statistics);
 
     let mut estimated_partition_loads = vec![0_u64; output_partitions];
-    let normal_keys = statistics
+    let mut normal_items = statistics
         .metadata
         .input
         .key_frequencies
         .iter()
         .filter(|(key, _)| !heavy_key_names.contains(key.as_str()))
-        .map(|(key, frequency)| {
-            let partition_id =
-                hashing::partition_id(key, output_partitions, config.partitioning.seed);
-            if let Some(load) = estimated_partition_loads.get_mut(partition_id) {
-                *load += *frequency;
-            }
+        .collect::<Vec<_>>();
+    normal_items.sort_by(|left, right| right.1.cmp(left.1).then_with(|| left.0.cmp(right.0)));
 
-            NormalKeyPlan {
-                key: key.clone(),
-                estimated_frequency: *frequency,
-                partition_id,
+    let mut normal_keys = Vec::with_capacity(normal_items.len());
+    for (key, frequency) in normal_items {
+        let partition_id = match config.partitioning.normal_key_assignment {
+            NormalKeyAssignment::Hash => {
+                hashing::partition_id(key, output_partitions, config.partitioning.seed)
             }
-        })
-        .collect();
+            NormalKeyAssignment::LoadAware => least_loaded_normal_partition(
+                key,
+                output_partitions,
+                config.partitioning.seed,
+                &estimated_partition_loads,
+            ),
+        };
+        if let Some(load) = estimated_partition_loads.get_mut(partition_id) {
+            *load += *frequency;
+        }
+
+        normal_keys.push(NormalKeyPlan {
+            key: key.clone(),
+            estimated_frequency: *frequency,
+            partition_id,
+        });
+    }
 
     let mut heavy_keys = Vec::new();
     for heavy in final_heavy_keys {
@@ -93,7 +105,14 @@ pub fn build_plan(config: &Config, statistics: &ComputedStatistics) -> Result<Pl
             salt_partitions,
         });
     }
-    let rewrite_decision = rewrite_decision(config, statistics, target_partition_rows, &heavy_keys);
+    let planned_partition_loads = estimated_partition_loads;
+    let rewrite_decision = rewrite_decision(
+        config,
+        statistics,
+        target_partition_rows,
+        &heavy_keys,
+        &planned_partition_loads,
+    );
     let cost_estimate = cost_estimate(
         statistics,
         rewrite_decision.rewrite_required,
@@ -128,6 +147,7 @@ pub fn build_plan(config: &Config, statistics: &ComputedStatistics) -> Result<Pl
                 salt_column: config.output.salt_column.clone(),
                 heavy_key_column: config.output.heavy_key_column.clone(),
             },
+            normal_key_assignment: config.partitioning.normal_key_assignment.clone(),
             normal_keys,
             heavy_keys,
             recommended_downstream_plan,
@@ -234,6 +254,7 @@ fn rewrite_decision(
     statistics: &ComputedStatistics,
     target_partition_rows: u64,
     heavy_keys: &[HeavyKeyPlan],
+    planned_partition_loads: &[u64],
 ) -> RewriteDecision {
     if config.partitioning.force_rewrite {
         return rewrite("force_rewrite");
@@ -245,18 +266,28 @@ fn rewrite_decision(
 
     let skew = &statistics.metadata.skew;
     if skew.max_partition_size > target_partition_rows {
+        if !planned_distribution_improves_skew(statistics, planned_partition_loads) {
+            return no_rewrite("planned_distribution_does_not_improve_skew");
+        }
         return rewrite("max_partition_exceeds_target_rows");
     }
 
     if skew.max_mean_imbalance_ratio > config.partitioning.no_op_max_imbalance_ratio {
+        if !planned_distribution_improves_skew(statistics, planned_partition_loads) {
+            return no_rewrite("planned_distribution_does_not_improve_skew");
+        }
         return rewrite("imbalance_ratio_exceeds_no_op_threshold");
     }
 
+    no_rewrite("no_rewrite_needed")
+}
+
+fn no_rewrite(reason: &str) -> RewriteDecision {
     RewriteDecision {
         rewrite_required: false,
         action: PlanAction::NoOp,
-        skip_reason: Some("no_rewrite_needed".to_string()),
-        cost_reason: "rewrite_not_required_no_skew".to_string(),
+        skip_reason: Some(reason.to_string()),
+        cost_reason: reason.to_string(),
     }
 }
 
@@ -267,6 +298,27 @@ fn rewrite(reason: &str) -> RewriteDecision {
         skip_reason: None,
         cost_reason: reason.to_string(),
     }
+}
+
+fn planned_distribution_improves_skew(
+    statistics: &ComputedStatistics,
+    planned_partition_loads: &[u64],
+) -> bool {
+    let before = &statistics.metadata.estimates.before_partition_sizes;
+    if planned_partition_loads.iter().sum::<u64>() != before.iter().sum::<u64>() {
+        return true;
+    }
+
+    let before_ratio = max_mean_imbalance_ratio(before);
+    let after_ratio = max_mean_imbalance_ratio(planned_partition_loads);
+    let before_max = before.iter().copied().max().unwrap_or_default();
+    let after_max = planned_partition_loads
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or_default();
+
+    after_ratio < before_ratio || after_max < before_max
 }
 
 fn cost_estimate(
@@ -461,6 +513,46 @@ fn total_input_size_bytes(statistics: &ComputedStatistics) -> Option<u64> {
     (total > 0).then_some(total)
 }
 
+fn max_mean_imbalance_ratio(partition_sizes: &[u64]) -> f64 {
+    if partition_sizes.is_empty() {
+        return 0.0;
+    }
+
+    let mean = partition_sizes.iter().sum::<u64>() as f64 / partition_sizes.len() as f64;
+    if mean == 0.0 {
+        return 0.0;
+    }
+
+    partition_sizes.iter().copied().max().unwrap_or_default() as f64 / mean
+}
+
+fn least_loaded_normal_partition(
+    key: &str,
+    output_partitions: usize,
+    seed: u64,
+    estimated_partition_loads: &[u64],
+) -> usize {
+    if output_partitions == 0 {
+        return 0;
+    }
+
+    (0..output_partitions)
+        .min_by_key(|candidate| {
+            (
+                estimated_partition_loads
+                    .get(*candidate)
+                    .copied()
+                    .unwrap_or_default(),
+                normal_candidate_rank(key, *candidate, seed),
+            )
+        })
+        .unwrap_or(0)
+}
+
+fn normal_candidate_rank(key: &str, candidate: usize, seed: u64) -> u64 {
+    hashing::hash_key(seed, &format!("{key}|candidate={candidate}"))
+}
+
 fn salt_count(frequency: u64, target_partition_rows: u64) -> usize {
     frequency.div_ceil(target_partition_rows.max(1)).max(1) as usize
 }
@@ -516,7 +608,7 @@ fn creation_timestamp() -> String {
 #[cfg(test)]
 mod tests {
     use crate::{
-        config::DatasetFormat,
+        config::{DatasetFormat, NormalKeyAssignment},
         dataset::{Dataset, Row},
         key_encoding::KeyValue,
         manifest::PlanAction,
@@ -863,7 +955,7 @@ mod tests {
 
     #[test]
     fn statistics_before_estimates_use_same_hash_function_as_planner() {
-        let config = example_config();
+        let config = config_with_normal_key_assignment("hash");
         let dataset = InputDataset::from_rows(Dataset::from_key_values(
             "user_id",
             ["a", "a", "b", "b", "c", "c", "d", "d"]
@@ -883,6 +975,98 @@ mod tests {
         assert_eq!(
             statistics.metadata.estimates.before_partition_sizes,
             planned_sizes
+        );
+    }
+
+    #[test]
+    fn load_aware_assignment_reduces_normal_key_hash_skew() {
+        let config = config_with_normal_key_assignment("load_aware");
+        let dataset = InputDataset::from_rows(Dataset::from_key_values(
+            "user_id",
+            normal_key_values_for_hash_partition(0, 12),
+        ));
+        let statistics = compute_statistics(&config, &dataset).expect("statistics should compute");
+        let plan = build_plan(&config, &statistics).expect("plan should build");
+        let planned_sizes = planned_normal_partition_sizes(&plan);
+
+        assert!(plan.metadata.heavy_keys.is_empty());
+        assert_eq!(
+            plan.metadata.normal_key_assignment,
+            NormalKeyAssignment::LoadAware
+        );
+        assert!(
+            max_mean_imbalance_ratio(&planned_sizes)
+                < max_mean_imbalance_ratio(&statistics.metadata.estimates.before_partition_sizes)
+        );
+    }
+
+    #[test]
+    fn hash_assignment_preserves_previous_behavior_when_configured() {
+        let config = config_with_normal_key_assignment("hash");
+        let dataset = InputDataset::from_rows(Dataset::from_key_values(
+            "user_id",
+            normal_key_values_for_hash_partition(0, 12),
+        ));
+        let statistics = compute_statistics(&config, &dataset).expect("statistics should compute");
+        let plan = build_plan(&config, &statistics).expect("plan should build");
+
+        assert_eq!(
+            plan.metadata.normal_key_assignment,
+            NormalKeyAssignment::Hash
+        );
+        assert!(plan.metadata.normal_keys.iter().all(|normal| {
+            normal.partition_id
+                == hashing::partition_id(
+                    &normal.key,
+                    plan.metadata.output_partitions,
+                    plan.metadata.seed,
+                )
+        }));
+        assert_eq!(plan.metadata.action, PlanAction::NoOp);
+        assert_eq!(
+            plan.metadata.skip_reason.as_deref(),
+            Some("planned_distribution_does_not_improve_skew")
+        );
+    }
+
+    #[test]
+    fn rewrite_with_normal_key_skew_improves_after_partition_sizes() {
+        let config = config_with_normal_key_assignment("load_aware");
+        let dataset = InputDataset::from_rows(Dataset::from_key_values(
+            "user_id",
+            normal_key_values_for_hash_partition(0, 12),
+        ));
+        let statistics = compute_statistics(&config, &dataset).expect("statistics should compute");
+        let plan = build_plan(&config, &statistics).expect("plan should build");
+        let planned_sizes = planned_normal_partition_sizes(&plan);
+
+        assert_eq!(plan.metadata.action, PlanAction::Rewrite);
+        assert!(plan.metadata.rewrite_required);
+        assert_eq!(
+            plan.metadata.cost_estimate.reason,
+            "max_partition_exceeds_target_rows"
+        );
+        assert!(
+            max_mean_imbalance_ratio(&planned_sizes)
+                < max_mean_imbalance_ratio(&statistics.metadata.estimates.before_partition_sizes)
+        );
+    }
+
+    #[test]
+    fn normal_key_assignment_is_deterministic() {
+        let config = config_with_normal_key_assignment("load_aware");
+        let dataset = InputDataset::from_rows(Dataset::from_key_values(
+            "user_id",
+            normal_key_values_for_hash_partition(0, 12),
+        ));
+        let statistics = compute_statistics(&config, &dataset).expect("statistics should compute");
+
+        let first_plan = build_plan(&config, &statistics).expect("first plan should build");
+        let second_plan = build_plan(&config, &statistics).expect("second plan should build");
+
+        assert_eq!(
+            first_plan.metadata.normal_keys,
+            second_plan.metadata.normal_keys
         );
     }
 
@@ -910,6 +1094,7 @@ mod tests {
         assert!(json.contains("\"feasibility\""));
         assert!(json.contains("\"recommended_downstream_plan\""));
         assert!(json.contains("\"two_stage_group_by\""));
+        assert!(json.contains("\"normal_key_assignment\":\"load_aware\""));
     }
 
     #[test]
@@ -1246,6 +1431,35 @@ resources:
         .expect("test config should parse")
     }
 
+    fn config_with_normal_key_assignment(normal_key_assignment: &str) -> Config {
+        Config::from_yaml_str(&format!(
+            r#"
+dataset:
+  input: "./data/input.parquet"
+  output: "./data/output_partitioned"
+  format: "parquet"
+
+partitioning:
+  key_columns: ["user_id"]
+  target_partition_size_mb: 128
+  max_partitions: 4
+  strategy: "adaptive_hash_salt"
+  normal_key_assignment: "{normal_key_assignment}"
+  heavy_key_alpha: 2.0
+  seed: 42
+
+job:
+  type: "group_by"
+  downstream_engine: "spark"
+
+resources:
+  local_threads: 8
+  memory_limit_mb: 4096
+"#
+        ))
+        .expect("test config should parse")
+    }
+
     fn config_with_job_type(job_type: &str) -> Config {
         Config::from_yaml_str(&format!(
             r#"
@@ -1378,5 +1592,30 @@ resources:
             rows,
             batches: Vec::new(),
         }
+    }
+
+    fn normal_key_values_for_hash_partition(partition_id: usize, count: usize) -> Vec<String> {
+        let mut values = Vec::new();
+        let mut candidate = 0;
+        while values.len() < count {
+            let value = format!("normal_{candidate}");
+            let row = Row::from_key_value("user_id", KeyValue::Utf8(value.clone()));
+            let key = row
+                .partition_key(&["user_id".to_string()])
+                .expect("row should have partition key");
+            if hashing::partition_id(&key, 4, 42) == partition_id {
+                values.push(value);
+            }
+            candidate += 1;
+        }
+        values
+    }
+
+    fn planned_normal_partition_sizes(plan: &Plan) -> Vec<u64> {
+        let mut sizes = vec![0; plan.metadata.output_partitions];
+        for normal in &plan.metadata.normal_keys {
+            sizes[normal.partition_id] += normal.estimated_frequency;
+        }
+        sizes
     }
 }

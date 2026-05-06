@@ -101,6 +101,7 @@ pub struct PartitioningConfig {
     pub target_partition_size_mb: NonZeroU64,
     pub max_partitions: NonZeroUsize,
     pub strategy: PartitioningStrategy,
+    pub normal_key_assignment: NormalKeyAssignment,
     pub heavy_key_alpha: f64,
     pub force_rewrite: bool,
     pub no_op_max_imbalance_ratio: f64,
@@ -150,6 +151,13 @@ impl Default for OutputConfig {
 pub enum PartitioningStrategy {
     AdaptiveHashSalt,
     FileSizeBalancing,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NormalKeyAssignment {
+    Hash,
+    LoadAware,
 }
 
 impl FromStr for PartitioningStrategy {
@@ -239,6 +247,7 @@ struct RawPartitioningConfig {
     target_partition_size_mb: u64,
     max_partitions: usize,
     strategy: String,
+    normal_key_assignment: Option<NormalKeyAssignment>,
     heavy_key_alpha: f64,
     force_rewrite: Option<bool>,
     no_op_max_imbalance_ratio: Option<f64>,
@@ -349,6 +358,10 @@ impl TryFrom<RawConfig> for Config {
                 target_partition_size_mb,
                 max_partitions,
                 strategy,
+                normal_key_assignment: raw
+                    .partitioning
+                    .normal_key_assignment
+                    .unwrap_or(NormalKeyAssignment::LoadAware),
                 heavy_key_alpha: raw.partitioning.heavy_key_alpha,
                 force_rewrite: raw.partitioning.force_rewrite.unwrap_or(false),
                 no_op_max_imbalance_ratio,
@@ -506,6 +519,10 @@ resources:
             config.partitioning.strategy,
             PartitioningStrategy::AdaptiveHashSalt
         );
+        assert_eq!(
+            config.partitioning.normal_key_assignment,
+            NormalKeyAssignment::LoadAware
+        );
         assert_eq!(config.job.job_type, JobType::GroupBy);
         assert_eq!(config.job.downstream_engine, DownstreamEngine::Spark);
         assert!(config.join.is_none());
@@ -580,6 +597,20 @@ resources:
 
         assert!(config.partitioning.force_rewrite);
         assert_eq!(config.partitioning.no_op_max_imbalance_ratio, 1.5);
+    }
+
+    #[test]
+    fn parses_optional_normal_key_assignment() {
+        let config = parse_replacing(
+            "strategy: \"adaptive_hash_salt\"",
+            "strategy: \"adaptive_hash_salt\"\n  normal_key_assignment: \"hash\"",
+        )
+        .expect("config with normal key assignment should parse");
+
+        assert_eq!(
+            config.partitioning.normal_key_assignment,
+            NormalKeyAssignment::Hash
+        );
     }
 
     #[test]
