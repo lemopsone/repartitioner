@@ -353,7 +353,10 @@ fn write_parquet_output(
         source,
     })?;
 
-    let output_files = if !dataset.files.is_empty() && dataset.batches.is_empty() {
+    let output_files = if dataset.format == DatasetFormat::Parquet
+        && !dataset.files.is_empty()
+        && dataset.batches.is_empty()
+    {
         write_streaming_parquet_output(output_dir, plan, stats, assignments, dataset)?
     } else {
         write_retained_parquet_output(output_dir, plan, assignments, dataset)?

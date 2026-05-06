@@ -35,12 +35,17 @@ Parquet as its first concrete dataset format, but Parquet is an implementation
 adapter rather than a constraint of the method.
 
 The crate exposes format-agnostic `DatasetReader` and `DatasetWriter` traits in
-`io/mod.rs`. `reader.rs` and `writer.rs` are facade modules: they select the
-adapter from `dataset.format` and keep the CLI behavior stable.
+`io/mod.rs`. `reader.rs` and `writer.rs` are facade modules: `reader.rs`
+selects the adapter from `dataset.input_format`, and `writer.rs` selects the
+adapter from `output.format`.
 
 The current adapter is `io/parquet.rs`. It owns all Arrow/Parquet-specific
 logic: file discovery, Parquet batch reading, Arrow key extraction, Hive-style
 `rp_partition=<id>` output directories, and Parquet file writing.
+
+Parquet is the only full read/write adapter in the current prototype. CSV is an
+input adapter for statistics and planning; CSV output is not implemented. A
+supported mixed-format scenario is CSV input with Parquet output.
 
 Parquet processing is two-pass:
 
@@ -99,10 +104,18 @@ repartitioner \
 
 ## Config example
 
+```yaml
 dataset:
-  input: "./data/input.parquet"
-  output: "./data/output_partitioned"
+  input: "./data/input.csv"
+  input_format: "csv"
+
+output:
+  path: "./data/output_partitioned"
   format: "parquet"
+  include_technical_columns: true
+  partition_column: "_rp_partition_id"
+  salt_column: "_rp_salt"
+  heavy_key_column: "_rp_is_heavy_key"
 
 partitioning:
   key_columns: ["user_id"]
@@ -120,6 +133,20 @@ resources:
   local_threads: 8
   memory_limit_mb: 4096
   fail_on_memory_limit: false
+```
+
+Legacy configs remain valid:
+
+```yaml
+dataset:
+  input: "./data/input.parquet"
+  output: "./data/output_partitioned"
+  format: "parquet"
+```
+
+In the legacy form, `dataset.format` is interpreted as `dataset.input_format`,
+`dataset.output` is interpreted as `output.path`, and `output.format` defaults
+to `dataset.format`.
 
 ## Resource Guard
 

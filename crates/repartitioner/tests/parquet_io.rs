@@ -171,6 +171,7 @@ fn writes_partitioned_parquet_dataset_and_reads_it_back() -> Result<()> {
     stats.set_after_partition_sizes(assignments.partition_row_counts.clone());
     let write_summary = writer::write_output(
         &output,
+        &config.output.format,
         &plan.metadata,
         &stats.metadata,
         &assignments,
@@ -222,6 +223,7 @@ fn omits_technical_columns_when_disabled() -> Result<()> {
     stats.set_after_partition_sizes(assignments.partition_row_counts.clone());
     let write_summary = writer::write_output(
         &output,
+        &config.output.format,
         &plan.metadata,
         &stats.metadata,
         &assignments,
@@ -270,6 +272,7 @@ fn writes_streaming_output_from_multiple_input_parquet_files() -> Result<()> {
     stats.set_after_partition_sizes(assignments.partition_row_counts.clone());
     let write_summary = writer::write_output(
         &output,
+        &config.output.format,
         &plan.metadata,
         &stats.metadata,
         &assignments,
@@ -316,6 +319,7 @@ fn preserves_row_identity_and_payload_after_repartitioning() -> Result<()> {
     stats.set_after_partition_sizes(assignments.partition_row_counts.clone());
     let write_summary = writer::write_output(
         &output,
+        &config.output.format,
         &plan.metadata,
         &stats.metadata,
         &assignments,

@@ -20,13 +20,39 @@ read_dataset
 
 Назначение стадий:
 
-- `read_dataset`: читает входной Parquet dataset и извлекает строки с ключами
-  партиционирования.
+- `read_dataset`: читает входной dataset через выбранный input adapter и
+  извлекает строки с ключами партиционирования.
 - `compute_statistics`: считает частоты ключей, кандидатов в heavy hitters и
   базовые метрики перекоса.
 - `build_plan`: строит план адаптивного hash/salt-разбиения.
 - `assign_partitions`: назначает каждой записи выходную `rp_partition`.
 - `write_output`: записывает Spark-compatible Parquet dataset и JSON-метаданные.
+
+## Форматы ввода и вывода
+
+Актуальная конфигурация разделяет формат входа и выхода:
+
+```yaml
+dataset:
+  input: "./data/input.csv"
+  input_format: "csv"
+
+output:
+  path: "./data/output_partitioned"
+  format: "parquet"
+```
+
+Старые конфиги с `dataset.output` и `dataset.format` остаются валидными.
+Семантика совместимости:
+
+- `dataset.format` используется как `dataset.input_format`;
+- `dataset.output` используется как `output.path`;
+- если `output.format` не указан, он наследуется из `dataset.format`.
+
+Поддержка форматов:
+
+- Parquet: чтение и запись.
+- CSV: чтение для статистики и планирования; запись CSV не реализована.
 
 ## Базовые команды проверки
 

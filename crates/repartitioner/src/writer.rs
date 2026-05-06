@@ -19,12 +19,13 @@ pub struct WriteSummary {
 
 pub fn write_output(
     output_dir: impl AsRef<Path>,
+    output_format: &DatasetFormat,
     plan: &PartitionPlan,
     stats: &StatsMetadata,
     assignments: &PartitionAssignmentSummary,
     dataset: &InputDataset,
 ) -> Result<WriteSummary> {
-    match &dataset.format {
+    match output_format {
         DatasetFormat::Parquet => ParquetDatasetWriter.write_output(
             output_dir.as_ref(),
             plan,
@@ -33,7 +34,7 @@ pub fn write_output(
             dataset,
         ),
         DatasetFormat::Csv => Err(Error::UnsupportedFormat(
-            "CSV output is not implemented; use parquet output".to_string(),
+            "CSV output is not implemented; use output.format = parquet".to_string(),
         )),
     }
 }

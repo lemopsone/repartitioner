@@ -35,7 +35,7 @@ impl InputDataset {
 }
 
 pub fn read_dataset(config: &Config) -> Result<InputDataset> {
-    match &config.dataset.format {
+    match &config.dataset.input_format {
         DatasetFormat::Parquet => ParquetDatasetReader.read_dataset(config),
         DatasetFormat::Csv => CsvDatasetReader.read_dataset(config),
     }

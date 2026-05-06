@@ -67,6 +67,12 @@ pub enum ConfigValidationError {
     #[error("dataset.input must not be empty")]
     MissingInputPath,
 
+    #[error("dataset.input_format or dataset.format must be specified")]
+    MissingInputFormat,
+
+    #[error("output.path or dataset.output must be specified")]
+    MissingOutputPath,
+
     #[error("partitioning.key_columns must contain at least one non-empty column name")]
     MissingKeyColumns,
 

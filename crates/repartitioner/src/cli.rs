@@ -30,7 +30,7 @@ impl CliArgs {
         }
 
         if let Some(output) = &self.output {
-            config.dataset.output = output.clone();
+            config.output.path = output.clone();
         }
 
         config.validate()?;

@@ -39,7 +39,7 @@ fn run(args: CliArgs) -> Result<()> {
         );
         let writing_started = Instant::now();
         let write_summary = writer::write_no_op_output(
-            &config.dataset.output,
+            &config.output.path,
             &plan.metadata,
             &statistics.metadata,
             &dataset,
@@ -54,7 +54,7 @@ fn run(args: CliArgs) -> Result<()> {
             total_seconds: elapsed_seconds(total_started),
         });
         writer::write_metadata_files(
-            &config.dataset.output,
+            &config.output.path,
             &plan.metadata,
             &statistics.metadata,
             &write_summary.manifest,
@@ -69,7 +69,8 @@ fn run(args: CliArgs) -> Result<()> {
 
     let writing_started = Instant::now();
     let write_summary = writer::write_output(
-        &config.dataset.output,
+        &config.output.path,
+        &config.output.format,
         &plan.metadata,
         &statistics.metadata,
         &assignments,
@@ -85,7 +86,7 @@ fn run(args: CliArgs) -> Result<()> {
         total_seconds: elapsed_seconds(total_started),
     });
     writer::write_metadata_files(
-        &config.dataset.output,
+        &config.output.path,
         &plan.metadata,
         &statistics.metadata,
         &write_summary.manifest,

@@ -52,6 +52,10 @@ impl Config {
             return Err(ConfigValidationError::MissingInputPath);
         }
 
+        if self.output.path.as_os_str().is_empty() {
+            return Err(ConfigValidationError::MissingOutputPath);
+        }
+
         if self
             .partitioning
             .key_columns
@@ -83,8 +87,7 @@ impl Config {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DatasetConfig {
     pub input: PathBuf,
-    pub output: PathBuf,
-    pub format: DatasetFormat,
+    pub input_format: DatasetFormat,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,6 +132,8 @@ pub enum HeavyHitterMode {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutputConfig {
+    pub path: PathBuf,
+    pub format: DatasetFormat,
     pub include_technical_columns: bool,
     pub partition_column: String,
     pub salt_column: String,
@@ -138,6 +143,8 @@ pub struct OutputConfig {
 impl Default for OutputConfig {
     fn default() -> Self {
         Self {
+            path: PathBuf::from("./data/output_partitioned"),
+            format: DatasetFormat::Parquet,
             include_technical_columns: true,
             partition_column: "_rp_partition_id".to_string(),
             salt_column: "_rp_salt".to_string(),
@@ -236,8 +243,9 @@ struct RawConfig {
 #[derive(Debug, Deserialize)]
 struct RawDatasetConfig {
     input: String,
-    output: String,
-    format: DatasetFormat,
+    output: Option<String>,
+    format: Option<DatasetFormat>,
+    input_format: Option<DatasetFormat>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -268,6 +276,8 @@ struct RawStorageConfig {
 
 #[derive(Debug, Deserialize)]
 struct RawOutputConfig {
+    path: Option<String>,
+    format: Option<DatasetFormat>,
     include_technical_columns: Option<bool>,
     partition_column: Option<String>,
     salt_column: Option<String>,
@@ -344,13 +354,19 @@ impl TryFrom<RawConfig> for Config {
         let strategy = PartitioningStrategy::from_str(raw.partitioning.strategy.as_str())?;
         let statistics = statistics_config(raw.statistics)?;
         let storage = storage_config(raw.storage)?;
-        let output = output_config(raw.output);
+        let legacy_dataset_format = raw.dataset.format.clone();
+        let input_format = raw
+            .dataset
+            .input_format
+            .clone()
+            .or_else(|| legacy_dataset_format.clone())
+            .ok_or(ConfigValidationError::MissingInputFormat)?;
+        let output = output_config(raw.output, raw.dataset.output, legacy_dataset_format)?;
 
         let config = Config {
             dataset: DatasetConfig {
                 input: PathBuf::from(raw.dataset.input.clone()),
-                output: PathBuf::from(raw.dataset.output),
-                format: raw.dataset.format,
+                input_format,
             },
             partitioning: PartitioningConfig {
                 key_columns: raw.partitioning.key_columns,
@@ -453,18 +469,46 @@ fn storage_config(
     })
 }
 
-fn output_config(raw: Option<RawOutputConfig>) -> OutputConfig {
+fn output_config(
+    raw: Option<RawOutputConfig>,
+    legacy_dataset_output: Option<String>,
+    legacy_dataset_format: Option<DatasetFormat>,
+) -> std::result::Result<OutputConfig, ConfigValidationError> {
     let defaults = OutputConfig::default();
     match raw {
-        Some(raw) => OutputConfig {
-            include_technical_columns: raw
-                .include_technical_columns
-                .unwrap_or(defaults.include_technical_columns),
-            partition_column: raw.partition_column.unwrap_or(defaults.partition_column),
-            salt_column: raw.salt_column.unwrap_or(defaults.salt_column),
-            heavy_key_column: raw.heavy_key_column.unwrap_or(defaults.heavy_key_column),
-        },
-        None => defaults,
+        Some(raw) => {
+            let path = raw
+                .path
+                .or(legacy_dataset_output)
+                .ok_or(ConfigValidationError::MissingOutputPath)?;
+            if path.trim().is_empty() {
+                return Err(ConfigValidationError::MissingOutputPath);
+            }
+            Ok(OutputConfig {
+                path: PathBuf::from(path),
+                format: raw
+                    .format
+                    .or(legacy_dataset_format)
+                    .unwrap_or_else(|| defaults.format.clone()),
+                include_technical_columns: raw
+                    .include_technical_columns
+                    .unwrap_or(defaults.include_technical_columns),
+                partition_column: raw.partition_column.unwrap_or(defaults.partition_column),
+                salt_column: raw.salt_column.unwrap_or(defaults.salt_column),
+                heavy_key_column: raw.heavy_key_column.unwrap_or(defaults.heavy_key_column),
+            })
+        }
+        None => {
+            let path = legacy_dataset_output.ok_or(ConfigValidationError::MissingOutputPath)?;
+            if path.trim().is_empty() {
+                return Err(ConfigValidationError::MissingOutputPath);
+            }
+            Ok(OutputConfig {
+                path: PathBuf::from(path),
+                format: legacy_dataset_format.unwrap_or_else(|| defaults.format.clone()),
+                ..defaults
+            })
+        }
     }
 }
 
@@ -500,7 +544,7 @@ resources:
         let config = Config::from_yaml_str(EXAMPLE_CONFIG).expect("config should parse");
 
         assert_eq!(config.dataset.input, PathBuf::from("./data/input.parquet"));
-        assert_eq!(config.dataset.format, DatasetFormat::Parquet);
+        assert_eq!(config.dataset.input_format, DatasetFormat::Parquet);
         assert_eq!(config.partitioning.key_columns, vec!["user_id".to_string()]);
         assert_eq!(config.partitioning.min_partitions.get(), 1);
         assert_eq!(config.partitioning.target_partition_size_mb.get(), 128);
@@ -511,6 +555,11 @@ resources:
         assert_eq!(config.statistics.approximate_capacity.get(), 10_000);
         assert_eq!(config.storage.target_file_size_mb.get(), 128);
         assert_eq!(config.storage.min_file_size_mb.get(), 16);
+        assert_eq!(
+            config.output.path,
+            PathBuf::from("./data/output_partitioned")
+        );
+        assert_eq!(config.output.format, DatasetFormat::Parquet);
         assert!(config.output.include_technical_columns);
         assert_eq!(config.output.partition_column, "_rp_partition_id");
         assert_eq!(config.output.salt_column, "_rp_salt");
@@ -532,11 +581,81 @@ resources:
     }
 
     #[test]
-    fn parses_csv_dataset_format() {
+    fn old_dataset_format_config_still_parses() {
+        let config = Config::from_yaml_str(EXAMPLE_CONFIG).expect("old config should parse");
+
+        assert_eq!(config.dataset.input_format, DatasetFormat::Parquet);
+        assert_eq!(
+            config.output.path,
+            PathBuf::from("./data/output_partitioned")
+        );
+        assert_eq!(config.output.format, DatasetFormat::Parquet);
+    }
+
+    #[test]
+    fn parquet_input_parquet_output_unchanged() {
+        let config = Config::from_yaml_str(EXAMPLE_CONFIG).expect("parquet config should parse");
+
+        assert_eq!(config.dataset.input, PathBuf::from("./data/input.parquet"));
+        assert_eq!(config.dataset.input_format, DatasetFormat::Parquet);
+        assert_eq!(
+            config.output.path,
+            PathBuf::from("./data/output_partitioned")
+        );
+        assert_eq!(config.output.format, DatasetFormat::Parquet);
+    }
+
+    #[test]
+    fn new_input_output_format_config_parses() {
+        let config = Config::from_yaml_str(
+            r#"
+dataset:
+  input: "./data/input.csv"
+  input_format: "csv"
+
+output:
+  path: "./data/output_partitioned"
+  format: "parquet"
+  include_technical_columns: true
+  partition_column: "_rp_partition_id"
+  salt_column: "_rp_salt"
+  heavy_key_column: "_rp_is_heavy_key"
+
+partitioning:
+  key_columns: ["user_id"]
+  target_partition_size_mb: 128
+  max_partitions: 128
+  strategy: "adaptive_hash_salt"
+  heavy_key_alpha: 2.0
+  seed: 42
+
+job:
+  type: "group_by"
+  downstream_engine: "spark"
+
+resources:
+  local_threads: 8
+  memory_limit_mb: 4096
+"#,
+        )
+        .expect("new config should parse");
+
+        assert_eq!(config.dataset.input, PathBuf::from("./data/input.csv"));
+        assert_eq!(config.dataset.input_format, DatasetFormat::Csv);
+        assert_eq!(
+            config.output.path,
+            PathBuf::from("./data/output_partitioned")
+        );
+        assert_eq!(config.output.format, DatasetFormat::Parquet);
+    }
+
+    #[test]
+    fn parses_csv_dataset_format_as_legacy_input_and_output_format() {
         let config = parse_replacing("format: \"parquet\"", "format: \"csv\"")
             .expect("csv config should parse");
 
-        assert_eq!(config.dataset.format, DatasetFormat::Csv);
+        assert_eq!(config.dataset.input_format, DatasetFormat::Csv);
+        assert_eq!(config.output.format, DatasetFormat::Csv);
     }
 
     #[test]
@@ -657,6 +776,11 @@ resources:
         .expect("config with output controls should parse");
 
         assert!(!config.output.include_technical_columns);
+        assert_eq!(
+            config.output.path,
+            PathBuf::from("./data/output_partitioned")
+        );
+        assert_eq!(config.output.format, DatasetFormat::Parquet);
         assert_eq!(config.output.partition_column, "partition_id");
         assert_eq!(config.output.salt_column, "salt");
         assert_eq!(config.output.heavy_key_column, "is_heavy");
