@@ -1,4 +1,10 @@
-use std::{fs, fs::File, path::Path, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    fs::File,
+    path::Path,
+    sync::Arc,
+};
 
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Int64Array, RecordBatch, StringArray, UInt32Array,
@@ -287,6 +293,54 @@ fn writes_streaming_output_from_multiple_input_parquet_files() -> Result<()> {
 }
 
 #[test]
+fn preserves_row_identity_and_payload_after_repartitioning() -> Result<()> {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let input = tempdir.path().join("identity_input.parquet");
+    let output = tempdir.path().join("identity_output");
+    let payload_bytes = 16 * 1024;
+    let user_ids = std::iter::repeat_n("heavy".to_string(), 96)
+        .chain((0..24).map(|index| format!("normal_{index:02}")))
+        .collect::<Vec<_>>();
+    write_user_id_row_id_payload_parquet(&input, &user_ids, payload_bytes)?;
+
+    let config = config_for_small_target(&input, &output);
+    let dataset = reader::read_dataset(&config)?;
+    let mut stats = statistics::compute_statistics(&config, &dataset)?;
+    let plan = planner::build_plan(&config, &stats)?;
+    let assignments = partitioner::assign_partitions(&plan, &dataset)?;
+    stats.set_after_partition_sizes(assignments.partition_row_counts.clone());
+    let write_summary = writer::write_output(
+        &output,
+        &plan.metadata,
+        &stats.metadata,
+        &assignments,
+        &dataset,
+    )?;
+
+    assert!(
+        plan.metadata
+            .heavy_keys
+            .iter()
+            .any(|key| key.key == "7:user_id#utf8:5:heavy" && key.salt_count > 1),
+        "heavy key should be split across multiple salt values"
+    );
+
+    let expected = expected_identity_records(&user_ids, payload_bytes);
+    let observed = read_output_identity_records(&output, &write_summary.manifest.output_files);
+
+    assert_eq!(observed.rows.len(), expected.len());
+    assert_eq!(observed.rows, expected);
+    assert!(
+        observed.heavy_salts.len() > 1,
+        "heavy key should use multiple materialized _rp_salt values"
+    );
+    assert_eq!(observed.normal_rows, 24);
+    assert_eq!(observed.normal_salt_nulls, observed.normal_rows);
+
+    Ok(())
+}
+
+#[test]
 fn writes_no_op_metadata_without_output_parquet_files() -> Result<()> {
     let tempdir = tempfile::tempdir().expect("tempdir should be created");
     let input = tempdir.path().join("input.parquet");
@@ -340,6 +394,36 @@ dataset:
 partitioning:
   key_columns: [{key_columns}]
   target_partition_size_mb: 128
+  max_partitions: 4
+  strategy: "adaptive_hash_salt"
+  heavy_key_alpha: 2.0
+  seed: 42
+
+job:
+  type: "group_by"
+  downstream_engine: "spark"
+
+resources:
+  local_threads: 2
+  memory_limit_mb: 1024
+"#,
+        input.display(),
+        output.display()
+    ))
+    .expect("test config should be valid")
+}
+
+fn config_for_small_target(input: &Path, output: &Path) -> Config {
+    Config::from_yaml_str(&format!(
+        r#"
+dataset:
+  input: "{}"
+  output: "{}"
+  format: "parquet"
+
+partitioning:
+  key_columns: ["user_id"]
+  target_partition_size_mb: 1
   max_partitions: 4
   strategy: "adaptive_hash_salt"
   heavy_key_alpha: 2.0
@@ -502,6 +586,134 @@ fn write_user_id_with_payload_parquet(path: &Path, values: &[&str]) -> Result<()
     writer.close()?;
 
     Ok(())
+}
+
+fn write_user_id_row_id_payload_parquet(
+    path: &Path,
+    user_ids: &[String],
+    payload_bytes: usize,
+) -> Result<()> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("user_id", DataType::Utf8, false),
+        Field::new("row_id", DataType::Int64, false),
+        Field::new("payload", DataType::Utf8, false),
+    ]));
+    let row_ids = (0..user_ids.len() as i64).collect::<Vec<_>>();
+    let payloads = row_ids
+        .iter()
+        .map(|row_id| Some(payload_for(*row_id, payload_bytes)))
+        .collect::<Vec<_>>();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(
+                user_ids
+                    .iter()
+                    .map(|value| Some(value.as_str()))
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(Int64Array::from(row_ids)) as ArrayRef,
+            Arc::new(StringArray::from(payloads)) as ArrayRef,
+        ],
+    )?;
+    let file = File::create(path).expect("input parquet should be created");
+    let mut writer = ArrowWriter::try_new(file, schema, None)?;
+    writer.write(&batch)?;
+    writer.close()?;
+
+    Ok(())
+}
+
+fn expected_identity_records(
+    user_ids: &[String],
+    payload_bytes: usize,
+) -> BTreeMap<i64, (String, String)> {
+    user_ids
+        .iter()
+        .enumerate()
+        .map(|(row_id, user_id)| {
+            (
+                row_id as i64,
+                (user_id.clone(), payload_for(row_id as i64, payload_bytes)),
+            )
+        })
+        .collect()
+}
+
+fn payload_for(row_id: i64, payload_bytes: usize) -> String {
+    let chunk = format!("payload-{row_id:05}-");
+    let mut payload = chunk.repeat(payload_bytes / chunk.len() + 1);
+    payload.truncate(payload_bytes);
+    payload
+}
+
+#[derive(Debug, Default)]
+struct OutputIdentityRecords {
+    rows: BTreeMap<i64, (String, String)>,
+    heavy_salts: BTreeSet<u32>,
+    normal_rows: usize,
+    normal_salt_nulls: usize,
+}
+
+fn read_output_identity_records(
+    output: &Path,
+    output_files: &[repartitioner::manifest::OutputFile],
+) -> OutputIdentityRecords {
+    let mut records = OutputIdentityRecords::default();
+
+    for output_file in output_files {
+        for batch in read_output_batches(output, output_file) {
+            let user_ids = batch
+                .column_by_name("user_id")
+                .expect("user_id column should exist")
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("user_id should be utf8");
+            let row_ids = batch
+                .column_by_name("row_id")
+                .expect("row_id column should exist")
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("row_id should be Int64");
+            let payloads = batch
+                .column_by_name("payload")
+                .expect("payload column should exist")
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("payload should be utf8");
+            let salts = batch
+                .column_by_name("_rp_salt")
+                .expect("salt column should exist")
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .expect("salt should be UInt32");
+
+            for row_index in 0..batch.num_rows() {
+                let row_id = row_ids.value(row_index);
+                let user_id = user_ids.value(row_index).to_string();
+                let payload = payloads.value(row_index).to_string();
+                assert!(
+                    records
+                        .rows
+                        .insert(row_id, (user_id.clone(), payload))
+                        .is_none(),
+                    "duplicated row_id {row_id}"
+                );
+
+                if user_id == "heavy" {
+                    assert!(!salts.is_null(row_index));
+                    records.heavy_salts.insert(salts.value(row_index));
+                } else {
+                    records.normal_rows += 1;
+                    if salts.is_null(row_index) {
+                        records.normal_salt_nulls += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    records
 }
 
 fn assert_output_schema_contains_payload_columns(
