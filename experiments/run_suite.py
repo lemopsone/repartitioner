@@ -45,6 +45,10 @@ SUMMARY_COLUMNS = [
     "after_max_mean_ratio",
     "before_max_partition_size",
     "after_max_partition_size",
+    "before_cv",
+    "after_cv",
+    "target_rows_satisfied_after",
+    "skew_reduction_ratio",
     "heavy_hitter_count",
     "output_partitions",
     "output_file_count",
@@ -350,10 +354,18 @@ def build_summary_row(
         "spark_method_aware_seconds": spark_method,
         "end_to_end_physical_only_seconds": add_optional(preprocessing_total, spark_physical),
         "end_to_end_method_aware_seconds": add_optional(preprocessing_total, spark_method),
-        "before_max_mean_ratio": (preprocessor_result.get("before") or {}).get("max_mean_ratio"),
-        "after_max_mean_ratio": (preprocessor_result.get("after") or {}).get("max_mean_ratio"),
-        "before_max_partition_size": (preprocessor_result.get("before") or {}).get("max"),
-        "after_max_partition_size": (preprocessor_result.get("after") or {}).get("max"),
+        "before_max_mean_ratio": preprocessor_result.get("before_max_mean_ratio")
+        or (preprocessor_result.get("before") or {}).get("max_mean_ratio"),
+        "after_max_mean_ratio": preprocessor_result.get("after_max_mean_ratio")
+        or (preprocessor_result.get("after") or {}).get("max_mean_ratio"),
+        "before_max_partition_size": preprocessor_result.get("before_max_partition_size")
+        or (preprocessor_result.get("before") or {}).get("max"),
+        "after_max_partition_size": preprocessor_result.get("after_max_partition_size")
+        or (preprocessor_result.get("after") or {}).get("max"),
+        "before_cv": preprocessor_result.get("before_cv"),
+        "after_cv": preprocessor_result.get("after_cv"),
+        "target_rows_satisfied_after": preprocessor_result.get("target_rows_satisfied_after"),
+        "skew_reduction_ratio": preprocessor_result.get("skew_reduction_ratio"),
         "heavy_hitter_count": preprocessor_result.get("heavy_hitter_count"),
         "output_partitions": preprocessor_result.get("output_partitions"),
         "output_file_count": preprocessor_result.get("output_file_count"),

@@ -146,7 +146,10 @@ pub struct StatsMetadata {
     pub heavy_hitter_detection: HeavyHitterDetectionMetadata,
     pub storage: StorageMetadata,
     pub join: Option<JoinStatisticsMetadata>,
+    pub before_skew: SkewStats,
+    pub after_skew: Option<SkewStats>,
     pub skew: SkewStats,
+    pub partition_bound: PartitionBoundMetadata,
     pub estimates: PartitionEstimates,
     pub resources: ResourceEstimate,
     pub timing: Option<TimingMetadata>,
@@ -236,6 +239,63 @@ pub struct SkewStats {
     pub partition_size_variance: f64,
     pub coefficient_of_variation: f64,
     pub max_mean_imbalance_ratio: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PartitionBoundMetadata {
+    pub target_partition_rows: u64,
+    pub estimated_before_max_partition_rows: u64,
+    pub estimated_after_max_partition_rows: Option<u64>,
+    pub target_rows_satisfied_before: bool,
+    pub target_rows_satisfied_after: Option<bool>,
+    pub reason: Option<String>,
+}
+
+impl PartitionBoundMetadata {
+    pub fn new(target_partition_rows: u64, before_partition_sizes: &[u64]) -> Self {
+        let estimated_before_max_partition_rows = before_partition_sizes
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or_default();
+        let target_rows_satisfied_before =
+            estimated_before_max_partition_rows <= target_partition_rows;
+
+        Self {
+            target_partition_rows,
+            estimated_before_max_partition_rows,
+            estimated_after_max_partition_rows: None,
+            target_rows_satisfied_before,
+            target_rows_satisfied_after: None,
+            reason: bound_reason(target_rows_satisfied_before, None),
+        }
+    }
+
+    pub fn set_after(&mut self, after_partition_sizes: &[u64]) {
+        let estimated_after_max_partition_rows = after_partition_sizes
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or_default();
+        let target_rows_satisfied_after =
+            estimated_after_max_partition_rows <= self.target_partition_rows;
+
+        self.estimated_after_max_partition_rows = Some(estimated_after_max_partition_rows);
+        self.target_rows_satisfied_after = Some(target_rows_satisfied_after);
+        self.reason = bound_reason(
+            self.target_rows_satisfied_before,
+            self.target_rows_satisfied_after,
+        );
+    }
+}
+
+fn bound_reason(before_satisfied: bool, after_satisfied: Option<bool>) -> Option<String> {
+    match after_satisfied {
+        Some(true) => None,
+        Some(false) => Some("after_max_partition_rows_exceed_target".to_string()),
+        None if before_satisfied => None,
+        None => Some("before_max_partition_rows_exceed_target".to_string()),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -431,6 +491,24 @@ mod tests {
                 min_file_size_bytes: 16_777_216,
             },
             join: None,
+            before_skew: SkewStats {
+                max_partition_size: 5,
+                mean_partition_size: 5.0,
+                median_partition_size: 5.0,
+                p95_partition_size: 5.0,
+                partition_size_variance: 0.0,
+                coefficient_of_variation: 0.0,
+                max_mean_imbalance_ratio: 1.0,
+            },
+            after_skew: Some(SkewStats {
+                max_partition_size: 5,
+                mean_partition_size: 5.0,
+                median_partition_size: 5.0,
+                p95_partition_size: 5.0,
+                partition_size_variance: 0.0,
+                coefficient_of_variation: 0.0,
+                max_mean_imbalance_ratio: 1.0,
+            }),
             skew: SkewStats {
                 max_partition_size: 5,
                 mean_partition_size: 5.0,
@@ -439,6 +517,14 @@ mod tests {
                 partition_size_variance: 0.0,
                 coefficient_of_variation: 0.0,
                 max_mean_imbalance_ratio: 1.0,
+            },
+            partition_bound: PartitionBoundMetadata {
+                target_partition_rows: 5,
+                estimated_before_max_partition_rows: 5,
+                estimated_after_max_partition_rows: Some(5),
+                target_rows_satisfied_before: true,
+                target_rows_satisfied_after: Some(true),
+                reason: None,
             },
             estimates: PartitionEstimates {
                 target_partitions: 2,
@@ -489,6 +575,9 @@ mod tests {
 
         assert_eq!(stats_value["version"].as_str(), Some("0.2.0"));
         assert!(stats_value["input"].is_object());
+        assert!(stats_value["before_skew"].is_object());
+        assert!(stats_value["after_skew"].is_object());
+        assert!(stats_value["partition_bound"].is_object());
         assert_eq!(
             stats_value["heavy_hitter_detection"]["mode"].as_str(),
             Some("exact")

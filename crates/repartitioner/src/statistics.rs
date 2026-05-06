@@ -7,8 +7,9 @@ use crate::{
     key_encoding::{key_value_to_string, key_value_type_name},
     manifest::{
         HeavyHitterDetectionMetadata, HeavyKeyPlan, InputFileStats, InputStats, JoinSideStatistics,
-        JoinStatisticsMetadata, PartitionEstimates, PlanKey, PlanKeyPart, ResourceEstimate,
-        SkewStats, StatsMetadata, StorageMetadata, TimingMetadata, METADATA_VERSION,
+        JoinStatisticsMetadata, PartitionBoundMetadata, PartitionEstimates, PlanKey, PlanKeyPart,
+        ResourceEstimate, SkewStats, StatsMetadata, StorageMetadata, TimingMetadata,
+        METADATA_VERSION,
     },
     reader::InputDataset,
     targeting, Config, Error, Result,
@@ -21,7 +22,12 @@ pub struct ComputedStatistics {
 
 impl ComputedStatistics {
     pub fn set_after_partition_sizes(&mut self, partition_sizes: Vec<u64>) {
+        let after_skew = skew_stats(&partition_sizes);
         self.metadata.estimates.after_partition_sizes = partition_sizes;
+        self.metadata.after_skew = Some(after_skew);
+        self.metadata
+            .partition_bound
+            .set_after(self.metadata.estimates.after_partition_sizes.as_slice());
     }
 
     pub fn set_timing(&mut self, timing: TimingMetadata) {
@@ -104,7 +110,13 @@ pub fn compute_statistics(config: &Config, dataset: &InputDataset) -> Result<Com
             min_file_size_bytes: mb_to_bytes(config.storage.min_file_size_mb.get()),
         },
         join: None,
+        before_skew: skew.clone(),
+        after_skew: None,
         skew,
+        partition_bound: PartitionBoundMetadata::new(
+            target_partitioning.target_partition_rows,
+            partition_sizes.as_slice(),
+        ),
         estimates: PartitionEstimates {
             target_partitions: target_partitioning.output_partitions,
             before_partition_sizes: partition_sizes,
@@ -597,11 +609,108 @@ resources:
         assert_eq!(statistics.metadata.estimates.target_partitions, 4);
         assert_eq!(estimates.len(), 4);
         assert_eq!(estimates.iter().sum::<u64>(), 8);
+        assert_eq!(statistics.metadata.before_skew, statistics.metadata.skew);
+        assert_eq!(statistics.metadata.after_skew, None);
         assert_eq!(skew.max_partition_size, *estimates.iter().max().unwrap());
         assert_eq!(skew.mean_partition_size, 2.0);
         assert!(skew.max_mean_imbalance_ratio >= 1.0);
         assert!(skew.partition_size_variance >= 0.0);
         assert!(skew.coefficient_of_variation >= 0.0);
+    }
+
+    #[test]
+    fn stats_contains_before_and_after_skew_for_rewrite() {
+        let config = example_config();
+        let dataset = InputDataset::from_rows(Dataset::from_key_values(
+            "user_id",
+            std::iter::repeat_n("heavy", 40).chain(["a", "b", "c", "d"]),
+        ));
+        let mut statistics =
+            compute_statistics(&config, &dataset).expect("statistics should compute");
+
+        statistics.set_after_partition_sizes(vec![11, 11, 11, 11]);
+
+        assert_eq!(statistics.metadata.before_skew, statistics.metadata.skew);
+        assert!(statistics.metadata.after_skew.is_some());
+        assert_eq!(
+            statistics
+                .metadata
+                .after_skew
+                .as_ref()
+                .unwrap()
+                .max_partition_size,
+            11
+        );
+    }
+
+    #[test]
+    fn stats_after_skew_equals_before_skew_for_no_op() {
+        let config = example_config();
+        let dataset = InputDataset::from_rows(Dataset::from_key_values(
+            "user_id",
+            ["a", "a", "b", "b", "c", "c", "d", "d"]
+                .into_iter()
+                .map(String::from),
+        ));
+        let mut statistics =
+            compute_statistics(&config, &dataset).expect("statistics should compute");
+
+        statistics.set_after_partition_sizes(
+            statistics.metadata.estimates.before_partition_sizes.clone(),
+        );
+
+        assert_eq!(
+            statistics.metadata.after_skew.as_ref(),
+            Some(&statistics.metadata.before_skew)
+        );
+    }
+
+    #[test]
+    fn partition_bound_reports_unsatisfied_when_after_max_exceeds_target() {
+        let config = config_with_target_size(1);
+        let dataset = input_dataset_with_file_size(
+            Dataset::from_key_values("user_id", (0..20).map(|index| format!("key_{index}"))),
+            20 * 1024 * 1024,
+        );
+        let mut statistics =
+            compute_statistics(&config, &dataset).expect("statistics should compute");
+
+        statistics.set_after_partition_sizes(vec![20, 0, 0, 0]);
+
+        assert_eq!(statistics.metadata.partition_bound.target_partition_rows, 1);
+        assert_eq!(
+            statistics
+                .metadata
+                .partition_bound
+                .target_rows_satisfied_after,
+            Some(false)
+        );
+        assert_eq!(
+            statistics.metadata.partition_bound.reason.as_deref(),
+            Some("after_max_partition_rows_exceed_target")
+        );
+    }
+
+    #[test]
+    fn partition_bound_reports_satisfied_when_after_max_within_target() {
+        let config = config_with_target_size(1);
+        let dataset = input_dataset_with_file_size(
+            Dataset::from_key_values("user_id", (0..20).map(|index| format!("key_{index}"))),
+            20 * 1024 * 1024,
+        );
+        let mut statistics =
+            compute_statistics(&config, &dataset).expect("statistics should compute");
+
+        statistics.set_after_partition_sizes(vec![1; 20]);
+
+        assert_eq!(
+            statistics
+                .metadata
+                .partition_bound
+                .target_rows_satisfied_after,
+            Some(true)
+        );
+        assert_eq!(statistics.metadata.partition_bound.reason, None);
     }
 
     #[test]
@@ -800,6 +909,34 @@ resources:
   local_threads: 8
   memory_limit_mb: {memory_limit_mb}
   fail_on_memory_limit: {fail_on_memory_limit}
+"#
+        ))
+        .expect("test config should parse")
+    }
+
+    fn config_with_target_size(target_partition_size_mb: u64) -> Config {
+        Config::from_yaml_str(&format!(
+            r#"
+dataset:
+  input: "./data/input.parquet"
+  output: "./data/output_partitioned"
+  format: "parquet"
+
+partitioning:
+  key_columns: ["user_id"]
+  target_partition_size_mb: {target_partition_size_mb}
+  max_partitions: 128
+  strategy: "adaptive_hash_salt"
+  heavy_key_alpha: 2.0
+  seed: 42
+
+job:
+  type: "group_by"
+  downstream_engine: "spark"
+
+resources:
+  local_threads: 8
+  memory_limit_mb: 4096
 "#
         ))
         .expect("test config should parse")

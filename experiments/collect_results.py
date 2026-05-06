@@ -43,6 +43,9 @@ def collect_results(
     stats_version = stats.get("version")
     manifest_version = manifest.get("version")
     timing = stats.get("timing") or {}
+    before_skew = stats.get("before_skew") or stats.get("skew") or {}
+    after_skew = stats.get("after_skew") or {}
+    partition_bound = stats.get("partition_bound") or {}
     before_sizes = stats_estimates.get("before_partition_sizes", [])
     input_reused = bool(manifest.get("input_reused", False))
     manifest_partitions = manifest.get("partitions", [])
@@ -94,6 +97,17 @@ def collect_results(
         "heavy_hitter_detection": stats.get("heavy_hitter_detection"),
         "storage": stats.get("storage"),
         "resources": stats.get("resources"),
+        "before_skew": before_skew,
+        "after_skew": after_skew,
+        "partition_bound": partition_bound,
+        "before_max_partition_size": before_skew.get("max_partition_size"),
+        "after_max_partition_size": after_skew.get("max_partition_size"),
+        "before_max_mean_ratio": before_skew.get("max_mean_imbalance_ratio"),
+        "after_max_mean_ratio": after_skew.get("max_mean_imbalance_ratio"),
+        "before_cv": before_skew.get("coefficient_of_variation"),
+        "after_cv": after_skew.get("coefficient_of_variation"),
+        "target_rows_satisfied_after": partition_bound.get("target_rows_satisfied_after"),
+        "skew_reduction_ratio": skew_reduction_ratio(before_skew, after_skew),
         "output_file_count": len(manifest.get("output_files", [])),
         "before": partition_summary(before_sizes),
         "after": partition_summary(after_sizes),
@@ -102,6 +116,14 @@ def collect_results(
         "manifest_path": str(output_dataset / "_manifest.json"),
     }
     return result
+
+
+def skew_reduction_ratio(before_skew: dict, after_skew: dict) -> float | None:
+    before = before_skew.get("max_mean_imbalance_ratio")
+    after = after_skew.get("max_mean_imbalance_ratio")
+    if before in (None, 0) or after is None:
+        return None
+    return after / before
 
 
 def partition_summary(sizes: list[int]) -> dict:
