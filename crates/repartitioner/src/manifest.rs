@@ -42,8 +42,16 @@ pub struct NormalKeyPlan {
 pub struct HeavyKeyPlan {
     pub key: String,
     pub estimated_frequency: u64,
+    pub detection_reasons: Vec<HeavyKeyReason>,
     pub salt_count: usize,
     pub salt_partitions: Vec<SaltPartitionPlan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HeavyKeyReason {
+    AboveMeanThreshold,
+    ExceedsTargetPartitionRows,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -162,6 +170,7 @@ mod tests {
             heavy_keys: vec![HeavyKeyPlan {
                 key: "42".to_string(),
                 estimated_frequency: 1000,
+                detection_reasons: vec![HeavyKeyReason::AboveMeanThreshold],
                 salt_count: 3,
                 salt_partitions: vec![
                     SaltPartitionPlan {

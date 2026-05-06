@@ -31,16 +31,21 @@ pub fn compute_statistics(config: &Config, dataset: &InputDataset) -> Result<Com
         dataset.rows.row_count(),
         estimated_row_width_bytes,
     );
-    let heavy_hitter_candidates: Vec<_> =
-        heavy_hitters::detect_heavy_hitters(&key_frequencies, config.partitioning.heavy_key_alpha)
-            .into_iter()
-            .map(|heavy| HeavyKeyPlan {
-                key: heavy.key,
-                estimated_frequency: heavy.frequency,
-                salt_count: 1,
-                salt_partitions: Vec::new(),
-            })
-            .collect();
+    let heavy_hitter_candidates = heavy_hitters::detect_heavy_hitter_candidates(
+        &key_frequencies,
+        config.partitioning.heavy_key_alpha,
+    )
+    .into_iter()
+    .map(heavy_key_plan_placeholder)
+    .collect();
+    let heavy_hitters = heavy_hitters::detect_final_heavy_keys(
+        &key_frequencies,
+        config.partitioning.heavy_key_alpha,
+        target_partitioning.target_partition_rows,
+    )
+    .into_iter()
+    .map(heavy_key_plan_placeholder)
+    .collect();
     let partition_sizes = base_partition_sizes(
         dataset,
         &config.partitioning.key_columns,
@@ -66,8 +71,8 @@ pub fn compute_statistics(config: &Config, dataset: &InputDataset) -> Result<Com
             mean_key_frequency,
             max_key_frequency,
             key_frequencies,
-            heavy_hitter_candidates: heavy_hitter_candidates.clone(),
-            heavy_hitters: heavy_hitter_candidates,
+            heavy_hitter_candidates,
+            heavy_hitters,
         },
         skew,
         estimates: PartitionEstimates {
@@ -78,6 +83,16 @@ pub fn compute_statistics(config: &Config, dataset: &InputDataset) -> Result<Com
     };
 
     Ok(ComputedStatistics { metadata })
+}
+
+fn heavy_key_plan_placeholder(heavy: heavy_hitters::HeavyHitter) -> HeavyKeyPlan {
+    HeavyKeyPlan {
+        key: heavy.key,
+        estimated_frequency: heavy.frequency,
+        detection_reasons: heavy.detection_reasons,
+        salt_count: 1,
+        salt_partitions: Vec::new(),
+    }
 }
 
 fn estimated_row_width_bytes(dataset: &InputDataset) -> Option<u64> {
@@ -207,7 +222,7 @@ fn percentile(sorted_values: &[u64], percentile: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use crate::{
-        config::DatasetFormat,
+        config::{Config, DatasetFormat},
         dataset::Dataset,
         reader::{InputDataset, InputFile},
         tests::example_config,
@@ -323,6 +338,62 @@ mod tests {
             statistics.metadata.estimates.before_partition_sizes,
             vec![dataset.rows.row_count()]
         );
+    }
+
+    #[test]
+    fn final_heavy_keys_include_keys_that_only_exceed_target_partition_rows() {
+        let config = Config::from_yaml_str(
+            r#"
+dataset:
+  input: "./data/input.parquet"
+  output: "./data/output_partitioned"
+  format: "parquet"
+
+partitioning:
+  key_columns: ["user_id"]
+  target_partition_size_mb: 1
+  max_partitions: 128
+  strategy: "adaptive_hash_salt"
+  heavy_key_alpha: 2.0
+  seed: 42
+
+job:
+  type: "group_by"
+  downstream_engine: "spark"
+
+resources:
+  local_threads: 8
+  memory_limit_mb: 4096
+"#,
+        )
+        .expect("config should parse");
+        let rows = Dataset::from_key_values(
+            "user_id",
+            std::iter::repeat_n("a", 2500)
+                .chain(std::iter::repeat_n("b", 2500))
+                .chain(std::iter::repeat_n("c", 2500))
+                .chain(std::iter::repeat_n("d", 2500)),
+        );
+        let dataset = InputDataset {
+            path: "<memory>".to_string(),
+            format: DatasetFormat::Parquet,
+            files: vec![InputFile {
+                path: "input.parquet".to_string(),
+                size_bytes: 104_850_000,
+            }],
+            rows,
+            batches: Vec::new(),
+        };
+
+        let statistics = compute_statistics(&config, &dataset).expect("statistics should compute");
+
+        assert_eq!(statistics.metadata.input.mean_key_frequency, 2500.0);
+        assert_eq!(statistics.metadata.input.heavy_hitter_candidates.len(), 0);
+        assert_eq!(statistics.metadata.input.heavy_hitters.len(), 4);
+        assert!(statistics.metadata.input.heavy_hitters.iter().all(|heavy| {
+            heavy.detection_reasons
+                == vec![crate::manifest::HeavyKeyReason::ExceedsTargetPartitionRows]
+        }));
     }
 
     #[test]

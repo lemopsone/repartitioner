@@ -4,7 +4,7 @@ use std::{
 };
 
 use crate::{
-    hashing,
+    hashing, heavy_hitters,
     manifest::{
         HeavyKeyPlan, NormalKeyPlan, PartitionPlan, PartitionPlanFeasibility, SaltPartitionPlan,
         METADATA_VERSION,
@@ -26,10 +26,12 @@ pub fn build_plan(config: &Config, statistics: &ComputedStatistics) -> Result<Pl
     );
     let output_partitions = target_partitioning.output_partitions;
     let target_partition_rows = target_partitioning.target_partition_rows;
-    let heavy_key_names: BTreeSet<_> = statistics
-        .metadata
-        .input
-        .heavy_hitters
+    let final_heavy_keys = heavy_hitters::detect_final_heavy_keys(
+        &statistics.metadata.input.key_frequencies,
+        config.partitioning.heavy_key_alpha,
+        target_partition_rows,
+    );
+    let heavy_key_names: BTreeSet<_> = final_heavy_keys
         .iter()
         .map(|heavy| heavy.key.as_str())
         .collect();
@@ -57,8 +59,8 @@ pub fn build_plan(config: &Config, statistics: &ComputedStatistics) -> Result<Pl
         .collect();
 
     let mut heavy_keys = Vec::new();
-    for heavy in &statistics.metadata.input.heavy_hitters {
-        let salt_count = salt_count(heavy.estimated_frequency, target_partition_rows);
+    for heavy in final_heavy_keys {
+        let salt_count = salt_count(heavy.frequency, target_partition_rows);
         let salt_partitions = (0..salt_count)
             .map(|salt_index| {
                 let partition_id = least_loaded_salt_partition(
@@ -69,7 +71,7 @@ pub fn build_plan(config: &Config, statistics: &ComputedStatistics) -> Result<Pl
                     &estimated_partition_loads,
                 );
                 if let Some(load) = estimated_partition_loads.get_mut(partition_id) {
-                    *load += estimated_salt_load(heavy.estimated_frequency, salt_count, salt_index);
+                    *load += estimated_salt_load(heavy.frequency, salt_count, salt_index);
                 }
 
                 SaltPartitionPlan {
@@ -81,7 +83,8 @@ pub fn build_plan(config: &Config, statistics: &ComputedStatistics) -> Result<Pl
 
         heavy_keys.push(HeavyKeyPlan {
             key: heavy.key.clone(),
-            estimated_frequency: heavy.estimated_frequency,
+            estimated_frequency: heavy.frequency,
+            detection_reasons: heavy.detection_reasons,
             salt_count,
             salt_partitions,
         });
@@ -166,8 +169,13 @@ fn creation_timestamp() -> String {
 #[cfg(test)]
 mod tests {
     use crate::{
-        dataset::Dataset, reader::InputDataset, statistics::compute_statistics, targeting,
-        tests::example_config, Config,
+        config::DatasetFormat,
+        dataset::Dataset,
+        reader::{InputDataset, InputFile},
+        statistics::compute_statistics,
+        targeting,
+        tests::example_config,
+        Config,
     };
 
     use super::*;
@@ -286,6 +294,42 @@ mod tests {
             plan.metadata.feasibility.reason.as_deref(),
             Some(targeting::REASON_REQUIRED_PARTITIONS_EXCEED_MAX)
         );
+    }
+
+    #[test]
+    fn plan_salts_keys_that_exceed_target_rows_even_without_mean_outliers() {
+        let config = config_with_partition_limits(1, 128, 1);
+        let rows = Dataset::from_key_values(
+            "user_id",
+            std::iter::repeat_n("a", 2500)
+                .chain(std::iter::repeat_n("b", 2500))
+                .chain(std::iter::repeat_n("c", 2500))
+                .chain(std::iter::repeat_n("d", 2500)),
+        );
+        let dataset = InputDataset {
+            path: "<memory>".to_string(),
+            format: DatasetFormat::Parquet,
+            files: vec![InputFile {
+                path: "input.parquet".to_string(),
+                size_bytes: 104_850_000,
+            }],
+            rows,
+            batches: Vec::new(),
+        };
+        let statistics = compute_statistics(&config, &dataset).expect("statistics should compute");
+
+        let plan = build_plan(&config, &statistics).expect("plan should build");
+
+        assert!(statistics.metadata.input.heavy_hitter_candidates.is_empty());
+        assert_eq!(statistics.metadata.input.heavy_hitters.len(), 4);
+        assert_eq!(plan.metadata.target_partition_rows, 100);
+        assert_eq!(plan.metadata.heavy_keys.len(), 4);
+        assert!(plan.metadata.normal_keys.is_empty());
+        assert!(plan
+            .metadata
+            .heavy_keys
+            .iter()
+            .all(|heavy| heavy.salt_count == 25 && !heavy.salt_partitions.is_empty()));
     }
 
     #[test]
