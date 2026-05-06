@@ -16,6 +16,7 @@ from pyspark.sql import functions as F
 @dataclass
 class BenchmarkResult:
     workload: str
+    mode: str
     dataset_label: str
     dataset_path: str
     elapsed_seconds: float
@@ -23,6 +24,7 @@ class BenchmarkResult:
     result_rows: int
     partitions: int
     spark_app_id: str
+    correctness: dict
     extra: dict
 
 
@@ -58,6 +60,14 @@ def base_parser(description: str) -> argparse.ArgumentParser:
     parser.add_argument("--app-name", default="repartitioner-benchmark")
     parser.add_argument("--shuffle-partitions", type=int, default=200)
     parser.add_argument("--warmup", action="store_true", help="Run one unmeasured action before timing.")
+    parser.add_argument(
+        "--include-method-aware",
+        action="store_true",
+        help=(
+            "Run method-aware groupBy for preprocessed datasets. This is also enabled "
+            "automatically when _partition_plan.json exists under --preprocessed."
+        ),
+    )
     return parser
 
 
@@ -72,40 +82,47 @@ def run_from_args(args: argparse.Namespace, workload_override: str | None = None
         workloads = ["group_by", "join"] if workload == "all" else [workload]
         original = spark.read.parquet(str(args.original))
         preprocessed = spark.read.parquet(str(args.preprocessed))
+        partition_plan = read_partition_plan(args.preprocessed)
         right = prepare_join_right(spark, original, args.join_right, args.key_column)
 
         results: list[BenchmarkResult] = []
         for workload_name in workloads:
-            for label, path, dataframe in [
-                ("original", args.original, original),
-                ("preprocessed", args.preprocessed, preprocessed),
-            ]:
-                if args.warmup:
-                    dataframe.select(args.key_column).limit(1).count()
-
-                if workload_name == "group_by":
-                    results.append(
-                        run_group_by(
-                            spark,
-                            dataframe,
-                            dataset_label=label,
-                            dataset_path=path,
-                            key_column=args.key_column,
-                        )
+            if workload_name == "group_by":
+                results.extend(
+                    run_group_by_benchmark(
+                        spark,
+                        original,
+                        preprocessed,
+                        original_path=args.original,
+                        preprocessed_path=args.preprocessed,
+                        key_column=args.key_column,
+                        partition_plan=partition_plan,
+                        include_method_aware=args.include_method_aware
+                        or partition_plan is not None,
+                        warmup=args.warmup,
                     )
-                elif workload_name == "join":
+                )
+            elif workload_name == "join":
+                for mode, label, path, dataframe in [
+                    ("baseline", "original", args.original, original),
+                    ("physical_only", "preprocessed", args.preprocessed, preprocessed),
+                ]:
+                    if args.warmup:
+                        dataframe.select(args.key_column).limit(1).count()
+
                     results.append(
                         run_join(
                             spark,
                             dataframe,
                             right,
+                            mode=mode,
                             dataset_label=label,
                             dataset_path=path,
                             key_column=args.key_column,
                         )
                     )
-                else:
-                    raise ValueError(f"unsupported workload: {workload_name}")
+            else:
+                raise ValueError(f"unsupported workload: {workload_name}")
 
         write_reports(results, args.json_report, args.csv_report)
         return results
@@ -113,10 +130,67 @@ def run_from_args(args: argparse.Namespace, workload_override: str | None = None
         spark.stop()
 
 
+def run_group_by_benchmark(
+    spark: SparkSession,
+    original: DataFrame,
+    preprocessed: DataFrame,
+    *,
+    original_path: Path,
+    preprocessed_path: Path,
+    key_column: str,
+    partition_plan: dict | None,
+    include_method_aware: bool,
+    warmup: bool,
+) -> list[BenchmarkResult]:
+    if warmup:
+        original.select(key_column).limit(1).count()
+    baseline = run_group_by(
+        spark,
+        original,
+        mode="baseline",
+        dataset_label="original",
+        dataset_path=original_path,
+        key_column=key_column,
+    )
+    baseline.correctness = correctness_against_baseline(baseline, baseline)
+
+    if warmup:
+        preprocessed.select(key_column).limit(1).count()
+    physical_only = run_group_by(
+        spark,
+        preprocessed,
+        mode="physical_only",
+        dataset_label="preprocessed",
+        dataset_path=preprocessed_path,
+        key_column=key_column,
+    )
+    physical_only.correctness = correctness_against_baseline(physical_only, baseline)
+
+    results = [baseline, physical_only]
+    if include_method_aware:
+        partition_column = resolve_method_aware_partition_column(preprocessed, partition_plan)
+        if warmup:
+            preprocessed.select(key_column).limit(1).count()
+        method_aware = run_method_aware_group_by(
+            spark,
+            preprocessed,
+            mode="method_aware",
+            dataset_label="preprocessed",
+            dataset_path=preprocessed_path,
+            key_column=key_column,
+            partition_column=partition_column,
+        )
+        method_aware.correctness = correctness_against_baseline(method_aware, baseline)
+        results.append(method_aware)
+
+    return results
+
+
 def run_group_by(
     spark: SparkSession,
     dataframe: DataFrame,
     *,
+    mode: str,
     dataset_label: str,
     dataset_path: Path,
     key_column: str,
@@ -137,6 +211,7 @@ def run_group_by(
     elapsed, metrics = timed(action)
     return BenchmarkResult(
         workload="group_by",
+        mode=mode,
         dataset_label=dataset_label,
         dataset_path=str(dataset_path),
         elapsed_seconds=elapsed,
@@ -144,7 +219,51 @@ def run_group_by(
         result_rows=metrics["result_rows"],
         partitions=dataframe.rdd.getNumPartitions(),
         spark_app_id=spark.sparkContext.applicationId,
+        correctness={},
         extra={"max_group_count": metrics["max_group_count"]},
+    )
+
+
+def run_method_aware_group_by(
+    spark: SparkSession,
+    dataframe: DataFrame,
+    *,
+    mode: str,
+    dataset_label: str,
+    dataset_path: Path,
+    key_column: str,
+    partition_column: str,
+) -> BenchmarkResult:
+    def action() -> dict:
+        partial = dataframe.groupBy(partition_column, key_column).count()
+        final = partial.groupBy(key_column).agg(F.sum("count").alias("count"))
+        row = final.agg(
+            F.count(F.lit(1)).alias("result_rows"),
+            F.sum("count").alias("rows"),
+            F.max("count").alias("max_group_count"),
+        ).collect()[0]
+        return {
+            "rows": int(row["rows"] or 0),
+            "result_rows": int(row["result_rows"] or 0),
+            "max_group_count": int(row["max_group_count"] or 0),
+        }
+
+    elapsed, metrics = timed(action)
+    return BenchmarkResult(
+        workload="group_by",
+        mode=mode,
+        dataset_label=dataset_label,
+        dataset_path=str(dataset_path),
+        elapsed_seconds=elapsed,
+        rows=metrics["rows"],
+        result_rows=metrics["result_rows"],
+        partitions=dataframe.rdd.getNumPartitions(),
+        spark_app_id=spark.sparkContext.applicationId,
+        correctness={},
+        extra={
+            "max_group_count": metrics["max_group_count"],
+            "partition_column": partition_column,
+        },
     )
 
 
@@ -153,6 +272,7 @@ def run_join(
     left: DataFrame,
     right: DataFrame,
     *,
+    mode: str,
     dataset_label: str,
     dataset_path: Path,
     key_column: str,
@@ -171,6 +291,7 @@ def run_join(
     elapsed, metrics = timed(action)
     return BenchmarkResult(
         workload="join",
+        mode=mode,
         dataset_label=dataset_label,
         dataset_path=str(dataset_path),
         elapsed_seconds=elapsed,
@@ -178,6 +299,7 @@ def run_join(
         result_rows=metrics["result_rows"],
         partitions=left.rdd.getNumPartitions(),
         spark_app_id=spark.sparkContext.applicationId,
+        correctness={},
         extra={"right_partitions": right.rdd.getNumPartitions()},
     )
 
@@ -202,6 +324,42 @@ def timed(action: Callable[[], dict]) -> tuple[float, dict]:
     return time.perf_counter() - started, result
 
 
+def correctness_against_baseline(result: BenchmarkResult, baseline: BenchmarkResult) -> dict:
+    return {
+        "row_count_matches_baseline": result.rows == baseline.rows,
+        "result_rows_match_baseline": result.result_rows == baseline.result_rows,
+    }
+
+
+def read_partition_plan(preprocessed_path: Path) -> dict | None:
+    plan_path = preprocessed_path / "_partition_plan.json"
+    if not plan_path.is_file():
+        return None
+    return json.loads(plan_path.read_text(encoding="utf-8"))
+
+
+def resolve_method_aware_partition_column(
+    preprocessed: DataFrame,
+    partition_plan: dict | None,
+) -> str:
+    candidates: list[str] = []
+    if partition_plan is not None:
+        technical_columns = partition_plan.get("technical_columns") or {}
+        partition_column = technical_columns.get("partition_column")
+        if partition_column:
+            candidates.append(partition_column)
+
+    candidates.extend(["rp_partition", "ap_partition"])
+    for column in candidates:
+        if column in preprocessed.columns:
+            return column
+
+    raise ValueError(
+        "method-aware groupBy requires a materialized partition column; "
+        f"checked {candidates}, available columns: {preprocessed.columns}"
+    )
+
+
 def write_reports(results: Iterable[BenchmarkResult], json_report: Path, csv_report: Path) -> None:
     rows = [asdict(result) for result in results]
     json_report.parent.mkdir(parents=True, exist_ok=True)
@@ -213,6 +371,7 @@ def write_reports(results: Iterable[BenchmarkResult], json_report: Path, csv_rep
             file,
             fieldnames=[
                 "workload",
+                "mode",
                 "dataset_label",
                 "dataset_path",
                 "elapsed_seconds",
@@ -220,6 +379,7 @@ def write_reports(results: Iterable[BenchmarkResult], json_report: Path, csv_rep
                 "result_rows",
                 "partitions",
                 "spark_app_id",
+                "correctness_json",
                 "extra_json",
             ],
         )
@@ -228,6 +388,7 @@ def write_reports(results: Iterable[BenchmarkResult], json_report: Path, csv_rep
             writer.writerow(
                 {
                     "workload": row["workload"],
+                    "mode": row["mode"],
                     "dataset_label": row["dataset_label"],
                     "dataset_path": row["dataset_path"],
                     "elapsed_seconds": row["elapsed_seconds"],
@@ -235,6 +396,7 @@ def write_reports(results: Iterable[BenchmarkResult], json_report: Path, csv_rep
                     "result_rows": row["result_rows"],
                     "partitions": row["partitions"],
                     "spark_app_id": row["spark_app_id"],
+                    "correctness_json": json.dumps(row["correctness"], sort_keys=True),
                     "extra_json": json.dumps(row["extra"], sort_keys=True),
                 }
             )
