@@ -28,6 +28,8 @@ SUMMARY_COLUMNS = [
     "zipf_exponent",
     "max_partitions",
     "target_partition_size_mb",
+    "target_file_size_mb",
+    "min_file_size_mb",
     "heavy_key_alpha",
     "heavy_hitter_mode",
     "approximate_capacity",
@@ -102,6 +104,8 @@ def main() -> None:
         "--target-partition-size-mb",
         default=",".join(str(value) for value in DEFAULT_TARGET_PARTITION_SIZE_MB),
     )
+    parser.add_argument("--target-file-size-mb", type=int, default=128)
+    parser.add_argument("--min-file-size-mb", type=int, default=16)
     parser.add_argument("--zipf-exponent", type=float, default=DEFAULT_ZIPF_EXPONENT)
     parser.add_argument("--heavy-key-alpha", type=float, default=DEFAULT_HEAVY_KEY_ALPHA)
     parser.add_argument("--heavy-hitter-mode", choices=["exact", "approximate"], default="exact")
@@ -253,6 +257,10 @@ def run_preprocessor(
         str(result_path),
         "--target-partition-size-mb",
         str(case.target_partition_size_mb),
+        "--target-file-size-mb",
+        str(args.target_file_size_mb),
+        "--min-file-size-mb",
+        str(args.min_file_size_mb),
         "--max-partitions",
         str(case.max_partitions),
         "--heavy-key-alpha",
@@ -327,6 +335,8 @@ def build_summary_row(
         "zipf_exponent": case.zipf_exponent if case.distribution == "zipf" else None,
         "max_partitions": case.max_partitions,
         "target_partition_size_mb": case.target_partition_size_mb,
+        "target_file_size_mb": (preprocessor_result.get("storage") or {}).get("target_file_size_mb"),
+        "min_file_size_mb": (preprocessor_result.get("storage") or {}).get("min_file_size_mb"),
         "heavy_key_alpha": case.heavy_key_alpha,
         "heavy_hitter_mode": args_heavy_hitter_mode(preprocessor_result),
         "approximate_capacity": args_approximate_capacity(preprocessor_result),

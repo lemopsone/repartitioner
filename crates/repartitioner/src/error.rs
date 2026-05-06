@@ -92,6 +92,17 @@ pub enum ConfigValidationError {
     #[error("statistics.approximate_capacity must be greater than zero, got {value}")]
     InvalidApproximateCapacity { value: usize },
 
+    #[error("storage.target_file_size_mb must be greater than zero, got {value}")]
+    InvalidTargetFileSize { value: u64 },
+
+    #[error("storage.min_file_size_mb must be greater than zero, got {value}")]
+    InvalidMinFileSize { value: u64 },
+
+    #[error(
+        "storage.min_file_size_mb must not be greater than storage.target_file_size_mb, got {min} > {target}"
+    )]
+    MinFileSizeGreaterThanTarget { min: u64, target: u64 },
+
     #[error("unsupported partitioning.strategy: {value}")]
     InvalidStrategyName { value: String },
 }

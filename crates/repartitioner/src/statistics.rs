@@ -5,7 +5,8 @@ use crate::{
     hashing, heavy_hitters,
     manifest::{
         HeavyHitterDetectionMetadata, HeavyKeyPlan, InputFileStats, InputStats, PartitionEstimates,
-        ResourceEstimate, SkewStats, StatsMetadata, TimingMetadata, METADATA_VERSION,
+        ResourceEstimate, SkewStats, StatsMetadata, StorageMetadata, TimingMetadata,
+        METADATA_VERSION,
     },
     reader::InputDataset,
     targeting, Config, Error, Result,
@@ -28,6 +29,7 @@ impl ComputedStatistics {
 
 pub fn compute_statistics(config: &Config, dataset: &InputDataset) -> Result<ComputedStatistics> {
     let resources = resource_estimate(config, dataset)?;
+    let file_size_summary = file_size_summary(config, dataset);
     let key_frequency_summary = key_frequency_summary(dataset, config);
     let key_frequencies = key_frequency_summary.frequencies;
     let mean_key_frequency = mean_frequency(&key_frequencies);
@@ -65,6 +67,7 @@ pub fn compute_statistics(config: &Config, dataset: &InputDataset) -> Result<Com
         version: METADATA_VERSION.to_string(),
         input: InputStats {
             total_rows: dataset.rows.row_count(),
+            input_file_count: dataset.files.len(),
             input_files: dataset
                 .files
                 .iter()
@@ -73,6 +76,11 @@ pub fn compute_statistics(config: &Config, dataset: &InputDataset) -> Result<Com
                     size_bytes: file.size_bytes,
                 })
                 .collect(),
+            min_file_size_bytes: file_size_summary.min_file_size_bytes,
+            max_file_size_bytes: file_size_summary.max_file_size_bytes,
+            mean_file_size_bytes: file_size_summary.mean_file_size_bytes,
+            small_file_count: file_size_summary.small_file_count,
+            oversized_file_count: file_size_summary.oversized_file_count,
             estimated_row_width_bytes,
             distinct_keys: Some(key_frequencies.len() as u64),
             mean_key_frequency,
@@ -82,6 +90,12 @@ pub fn compute_statistics(config: &Config, dataset: &InputDataset) -> Result<Com
             heavy_hitters,
         },
         heavy_hitter_detection: key_frequency_summary.detection_metadata,
+        storage: StorageMetadata {
+            target_file_size_mb: config.storage.target_file_size_mb.get(),
+            min_file_size_mb: config.storage.min_file_size_mb.get(),
+            target_file_size_bytes: mb_to_bytes(config.storage.target_file_size_mb.get()),
+            min_file_size_bytes: mb_to_bytes(config.storage.min_file_size_mb.get()),
+        },
         skew,
         estimates: PartitionEstimates {
             target_partitions: target_partitioning.output_partitions,
@@ -99,6 +113,57 @@ pub fn compute_statistics(config: &Config, dataset: &InputDataset) -> Result<Com
 struct KeyFrequencySummary {
     frequencies: BTreeMap<String, u64>,
     detection_metadata: HeavyHitterDetectionMetadata,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct FileSizeSummary {
+    min_file_size_bytes: Option<u64>,
+    max_file_size_bytes: Option<u64>,
+    mean_file_size_bytes: Option<f64>,
+    small_file_count: usize,
+    oversized_file_count: usize,
+}
+
+fn file_size_summary(config: &Config, dataset: &InputDataset) -> FileSizeSummary {
+    let file_sizes = dataset
+        .files
+        .iter()
+        .map(|file| file.size_bytes)
+        .collect::<Vec<_>>();
+    if file_sizes.is_empty() {
+        return FileSizeSummary {
+            min_file_size_bytes: None,
+            max_file_size_bytes: None,
+            mean_file_size_bytes: None,
+            small_file_count: 0,
+            oversized_file_count: 0,
+        };
+    }
+
+    let min_file_size_bytes = file_sizes.iter().copied().min();
+    let max_file_size_bytes = file_sizes.iter().copied().max();
+    let mean_file_size_bytes =
+        Some(file_sizes.iter().sum::<u64>() as f64 / file_sizes.len() as f64);
+    let min_size_bytes = mb_to_bytes(config.storage.min_file_size_mb.get());
+    let target_size_bytes = mb_to_bytes(config.storage.target_file_size_mb.get());
+
+    FileSizeSummary {
+        min_file_size_bytes,
+        max_file_size_bytes,
+        mean_file_size_bytes,
+        small_file_count: file_sizes
+            .iter()
+            .filter(|size_bytes| **size_bytes < min_size_bytes)
+            .count(),
+        oversized_file_count: file_sizes
+            .iter()
+            .filter(|size_bytes| **size_bytes > target_size_bytes)
+            .count(),
+    }
+}
+
+fn mb_to_bytes(value: u64) -> u64 {
+    value.saturating_mul(1024 * 1024)
 }
 
 fn resource_estimate(config: &Config, dataset: &InputDataset) -> Result<ResourceEstimate> {

@@ -20,6 +20,8 @@ def main() -> None:
     parser.add_argument("--config", type=Path, help="Optional config path to write/use.")
     parser.add_argument("--key-column", default="user_id")
     parser.add_argument("--target-partition-size-mb", type=int, default=128)
+    parser.add_argument("--target-file-size-mb", type=int, default=128)
+    parser.add_argument("--min-file-size-mb", type=int, default=16)
     parser.add_argument("--max-partitions", type=int, default=16)
     parser.add_argument("--heavy-key-alpha", type=float, default=2.0)
     parser.add_argument("--heavy-hitter-mode", choices=["exact", "approximate"], default="exact")
@@ -49,6 +51,8 @@ def main() -> None:
         output_path=args.output,
         key_column=args.key_column,
         target_partition_size_mb=args.target_partition_size_mb,
+        target_file_size_mb=args.target_file_size_mb,
+        min_file_size_mb=args.min_file_size_mb,
         max_partitions=args.max_partitions,
         heavy_key_alpha=args.heavy_key_alpha,
         heavy_hitter_mode=args.heavy_hitter_mode,
@@ -118,6 +122,8 @@ def write_config(
     max_partitions: int,
     heavy_key_alpha: float,
     seed: int,
+    target_file_size_mb: int = 128,
+    min_file_size_mb: int = 16,
     heavy_hitter_mode: str = "exact",
     approximate_capacity: int = 10_000,
     force_rewrite: bool = False,
@@ -142,6 +148,10 @@ partitioning:
 statistics:
   heavy_hitter_mode: "{heavy_hitter_mode}"
   approximate_capacity: {approximate_capacity}
+
+storage:
+  target_file_size_mb: {target_file_size_mb}
+  min_file_size_mb: {min_file_size_mb}
 
 job:
   type: "group_by"

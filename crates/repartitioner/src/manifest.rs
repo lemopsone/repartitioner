@@ -115,6 +115,7 @@ pub struct StatsMetadata {
     pub version: String,
     pub input: InputStats,
     pub heavy_hitter_detection: HeavyHitterDetectionMetadata,
+    pub storage: StorageMetadata,
     pub skew: SkewStats,
     pub estimates: PartitionEstimates,
     pub resources: ResourceEstimate,
@@ -150,7 +151,13 @@ pub struct ResourceEstimate {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InputStats {
     pub total_rows: u64,
+    pub input_file_count: usize,
     pub input_files: Vec<InputFileStats>,
+    pub min_file_size_bytes: Option<u64>,
+    pub max_file_size_bytes: Option<u64>,
+    pub mean_file_size_bytes: Option<f64>,
+    pub small_file_count: usize,
+    pub oversized_file_count: usize,
     pub estimated_row_width_bytes: Option<u64>,
     pub distinct_keys: Option<u64>,
     pub mean_key_frequency: f64,
@@ -158,6 +165,14 @@ pub struct InputStats {
     pub key_frequencies: BTreeMap<String, u64>,
     pub heavy_hitter_candidates: Vec<HeavyKeyPlan>,
     pub heavy_hitters: Vec<HeavyKeyPlan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageMetadata {
+    pub target_file_size_mb: u64,
+    pub min_file_size_mb: u64,
+    pub target_file_size_bytes: u64,
+    pub min_file_size_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -326,10 +341,16 @@ mod tests {
             version: METADATA_VERSION.to_string(),
             input: InputStats {
                 total_rows: 10,
+                input_file_count: 1,
                 input_files: vec![InputFileStats {
                     path: "input.parquet".to_string(),
                     size_bytes: 2048,
                 }],
+                min_file_size_bytes: Some(2048),
+                max_file_size_bytes: Some(2048),
+                mean_file_size_bytes: Some(2048.0),
+                small_file_count: 1,
+                oversized_file_count: 0,
                 estimated_row_width_bytes: Some(128),
                 distinct_keys: Some(2),
                 mean_key_frequency: 5.0,
@@ -342,6 +363,12 @@ mod tests {
                 mode: "exact".to_string(),
                 capacity: 10_000,
                 error_bound: "0".to_string(),
+            },
+            storage: StorageMetadata {
+                target_file_size_mb: 128,
+                min_file_size_mb: 16,
+                target_file_size_bytes: 134_217_728,
+                min_file_size_bytes: 16_777_216,
             },
             skew: SkewStats {
                 max_partition_size: 5,
@@ -405,6 +432,9 @@ mod tests {
             stats_value["heavy_hitter_detection"]["mode"].as_str(),
             Some("exact")
         );
+        assert_eq!(stats_value["input"]["input_file_count"].as_u64(), Some(1));
+        assert_eq!(stats_value["input"]["small_file_count"].as_u64(), Some(1));
+        assert!(stats_value["storage"].is_object());
         assert!(stats_value["skew"].is_object());
         assert!(stats_value["estimates"].is_object());
         assert!(stats_value["resources"].is_object());

@@ -30,6 +30,11 @@ fn reads_key_rows_from_temporary_parquet_file() -> Result<()> {
         dataset.batches.is_empty(),
         "Parquet reader should not retain full RecordBatch values after the key scan"
     );
+    assert_eq!(stats.metadata.input.input_file_count, 1);
+    assert_eq!(stats.metadata.input.small_file_count, 1);
+    assert_eq!(stats.metadata.input.oversized_file_count, 0);
+    assert!(stats.metadata.input.min_file_size_bytes.is_some());
+    assert_eq!(stats.metadata.storage.target_file_size_mb, 128);
     assert_eq!(stats.metadata.input.distinct_keys, Some(3));
     assert_eq!(
         stats
@@ -297,7 +302,7 @@ fn preserves_row_identity_and_payload_after_repartitioning() -> Result<()> {
     let tempdir = tempfile::tempdir().expect("tempdir should be created");
     let input = tempdir.path().join("identity_input.parquet");
     let output = tempdir.path().join("identity_output");
-    let payload_bytes = 16 * 1024;
+    let payload_bytes = 64 * 1024;
     let user_ids = std::iter::repeat_n("heavy".to_string(), 96)
         .chain((0..24).map(|index| format!("normal_{index:02}")))
         .collect::<Vec<_>>();
@@ -330,6 +335,15 @@ fn preserves_row_identity_and_payload_after_repartitioning() -> Result<()> {
 
     assert_eq!(observed.rows.len(), expected.len());
     assert_eq!(observed.rows, expected);
+    assert!(
+        write_summary.manifest.output_files.len() > 1,
+        "wide rows should be rolled into multiple output files"
+    );
+    assert!(write_summary
+        .manifest
+        .partitions
+        .iter()
+        .any(|partition| partition.file_count > 1));
     assert!(
         observed.heavy_salts.len() > 1,
         "heavy key should use multiple materialized _rp_salt values"
@@ -432,6 +446,10 @@ partitioning:
 job:
   type: "group_by"
   downstream_engine: "spark"
+
+storage:
+  target_file_size_mb: 1
+  min_file_size_mb: 1
 
 resources:
   local_threads: 2

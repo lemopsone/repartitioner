@@ -354,7 +354,7 @@ fn write_parquet_output(
     })?;
 
     let output_files = if !dataset.files.is_empty() && dataset.batches.is_empty() {
-        write_streaming_parquet_output(output_dir, plan, assignments, dataset)?
+        write_streaming_parquet_output(output_dir, plan, stats, assignments, dataset)?
     } else {
         write_retained_parquet_output(output_dir, plan, assignments, dataset)?
     };
@@ -414,10 +414,12 @@ fn write_retained_parquet_output(
 fn write_streaming_parquet_output(
     output_dir: &Path,
     plan: &PartitionPlan,
+    stats: &StatsMetadata,
     assignments: &PartitionAssignmentSummary,
     dataset: &InputDataset,
 ) -> Result<Vec<OutputFile>> {
-    let mut open_writers = BTreeMap::<usize, OpenPartitionWriter>::new();
+    let mut state = StreamingOutputState::default();
+    let file_sizing = FileSizing::from_stats(stats);
     let scanner = ParquetDatasetReader;
 
     scanner.scan_record_batches(dataset, &mut |batch_start, batch| {
@@ -427,30 +429,57 @@ fn write_streaming_parquet_output(
             assignments,
             batch_start,
             batch,
-            &mut open_writers,
+            file_sizing,
+            &mut state,
         )
     })?;
 
-    let mut output_files = Vec::new();
-    for (partition_id, open_writer) in open_writers {
-        open_writer.writer.close()?;
-        let file_path = output_dir.join(&open_writer.relative_path);
-        let size_bytes = fs::metadata(&file_path).ok().map(|metadata| metadata.len());
-        output_files.push(OutputFile {
-            path: open_writer.relative_path,
-            partition_id,
-            row_count: open_writer.row_count,
-            size_bytes,
-        });
+    let partition_ids = state.open_writers.keys().copied().collect::<Vec<_>>();
+    for partition_id in partition_ids {
+        close_partition_writer(output_dir, partition_id, &mut state)?;
     }
 
-    Ok(output_files)
+    Ok(state.output_files)
+}
+
+#[derive(Default)]
+struct StreamingOutputState {
+    open_writers: BTreeMap<usize, OpenPartitionWriter>,
+    next_file_indexes: BTreeMap<usize, usize>,
+    output_files: Vec<OutputFile>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FileSizing {
+    estimated_row_width_bytes: u64,
+    target_file_size_bytes: u64,
+    max_rows_per_file: usize,
+}
+
+impl FileSizing {
+    fn from_stats(stats: &StatsMetadata) -> Self {
+        let estimated_row_width_bytes = stats.input.estimated_row_width_bytes.unwrap_or(1).max(1);
+        let target_file_size_bytes = stats.storage.target_file_size_bytes.max(1);
+        let max_rows_per_file =
+            (target_file_size_bytes / estimated_row_width_bytes).max(1) as usize;
+
+        Self {
+            estimated_row_width_bytes,
+            target_file_size_bytes,
+            max_rows_per_file,
+        }
+    }
+
+    fn estimated_batch_size_bytes(&self, row_count: usize) -> u64 {
+        (row_count as u64).saturating_mul(self.estimated_row_width_bytes)
+    }
 }
 
 struct OpenPartitionWriter {
     writer: ArrowWriter<File>,
     relative_path: String,
     row_count: u64,
+    estimated_size_bytes: u64,
 }
 
 fn write_streamed_batch(
@@ -459,7 +488,8 @@ fn write_streamed_batch(
     assignments: &PartitionAssignmentSummary,
     batch_start: usize,
     batch: RecordBatch,
-    open_writers: &mut BTreeMap<usize, OpenPartitionWriter>,
+    file_sizing: FileSizing,
+    state: &mut StreamingOutputState,
 ) -> Result<()> {
     let batch_assignments = batch_assignments(assignments, batch_start, batch.num_rows())?;
     let mut local_by_partition = BTreeMap::<usize, Vec<(u32, RecordPartitionAssignment)>>::new();
@@ -481,27 +511,84 @@ fn write_streamed_batch(
             continue;
         }
 
-        let local_indexes = rows
-            .iter()
-            .map(|(local_index, _)| *local_index)
-            .collect::<Vec<_>>();
-        let local_assignments = rows
-            .into_iter()
-            .map(|(_, assignment)| assignment)
-            .collect::<Vec<_>>();
-        let output_batch = take_batch(&batch, &local_indexes)?;
-        let output_batch =
-            append_technical_columns(output_batch, &local_assignments, &plan.technical_columns)?;
-        let row_count = output_batch.num_rows() as u64;
-        let writer = partition_writer(
-            output_dir,
-            partition_id,
-            output_batch.schema(),
-            open_writers,
-        )?;
-        writer.writer.write(&output_batch)?;
-        writer.row_count += row_count;
+        for row_chunk in rows.chunks(file_sizing.max_rows_per_file) {
+            let local_indexes = row_chunk
+                .iter()
+                .map(|(local_index, _)| *local_index)
+                .collect::<Vec<_>>();
+            let local_assignments = row_chunk
+                .iter()
+                .map(|(_, assignment)| assignment.clone())
+                .collect::<Vec<_>>();
+            let output_batch = take_batch(&batch, &local_indexes)?;
+            let output_batch = append_technical_columns(
+                output_batch,
+                &local_assignments,
+                &plan.technical_columns,
+            )?;
+            let row_count = output_batch.num_rows();
+            let estimated_size_bytes = file_sizing.estimated_batch_size_bytes(row_count);
+
+            if should_roll_partition_writer(
+                partition_id,
+                estimated_size_bytes,
+                file_sizing.target_file_size_bytes,
+                &state.open_writers,
+            ) {
+                close_partition_writer(output_dir, partition_id, state)?;
+            }
+
+            let writer = partition_writer(
+                output_dir,
+                partition_id,
+                output_batch.schema(),
+                &mut state.open_writers,
+                &mut state.next_file_indexes,
+            )?;
+            writer.writer.write(&output_batch)?;
+            writer.row_count += row_count as u64;
+            writer.estimated_size_bytes = writer
+                .estimated_size_bytes
+                .saturating_add(estimated_size_bytes);
+        }
     }
+
+    Ok(())
+}
+
+fn should_roll_partition_writer(
+    partition_id: usize,
+    next_batch_size_bytes: u64,
+    target_file_size_bytes: u64,
+    open_writers: &BTreeMap<usize, OpenPartitionWriter>,
+) -> bool {
+    open_writers.get(&partition_id).is_some_and(|writer| {
+        writer.row_count > 0
+            && writer
+                .estimated_size_bytes
+                .saturating_add(next_batch_size_bytes)
+                > target_file_size_bytes
+    })
+}
+
+fn close_partition_writer(
+    output_dir: &Path,
+    partition_id: usize,
+    state: &mut StreamingOutputState,
+) -> Result<()> {
+    let Some(open_writer) = state.open_writers.remove(&partition_id) else {
+        return Ok(());
+    };
+
+    open_writer.writer.close()?;
+    let file_path = output_dir.join(&open_writer.relative_path);
+    let size_bytes = fs::metadata(&file_path).ok().map(|metadata| metadata.len());
+    state.output_files.push(OutputFile {
+        path: open_writer.relative_path,
+        partition_id,
+        row_count: open_writer.row_count,
+        size_bytes,
+    });
 
     Ok(())
 }
@@ -525,11 +612,13 @@ fn partition_writer<'a>(
     partition_id: usize,
     schema: Arc<Schema>,
     open_writers: &'a mut BTreeMap<usize, OpenPartitionWriter>,
+    next_file_indexes: &mut BTreeMap<usize, usize>,
 ) -> Result<&'a mut OpenPartitionWriter> {
     match open_writers.entry(partition_id) {
         std::collections::btree_map::Entry::Vacant(entry) => {
-            let relative_path =
-                format!("rp_partition={partition_id}/part-{partition_id:05}.parquet");
+            let file_index = next_file_indexes.entry(partition_id).or_insert(0);
+            let relative_path = format!("rp_partition={partition_id}/part-{file_index:05}.parquet");
+            *file_index += 1;
             let file_path = output_dir.join(&relative_path);
             if let Some(parent) = file_path.parent() {
                 fs::create_dir_all(parent).map_err(|source| Error::WriteFile {
@@ -547,6 +636,7 @@ fn partition_writer<'a>(
                 writer,
                 relative_path,
                 row_count: 0,
+                estimated_size_bytes: 0,
             }))
         }
         std::collections::btree_map::Entry::Occupied(entry) => Ok(entry.into_mut()),

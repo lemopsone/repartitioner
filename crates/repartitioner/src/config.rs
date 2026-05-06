@@ -14,6 +14,7 @@ pub struct Config {
     pub dataset: DatasetConfig,
     pub partitioning: PartitioningConfig,
     pub statistics: StatisticsConfig,
+    pub storage: StorageConfig,
     pub output: OutputConfig,
     pub job: JobConfig,
     pub resources: ResourceConfig,
@@ -111,6 +112,12 @@ pub struct StatisticsConfig {
     pub approximate_capacity: NonZeroUsize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StorageConfig {
+    pub target_file_size_mb: NonZeroU64,
+    pub min_file_size_mb: NonZeroU64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HeavyHitterMode {
@@ -141,6 +148,7 @@ impl Default for OutputConfig {
 #[serde(rename_all = "snake_case")]
 pub enum PartitioningStrategy {
     AdaptiveHashSalt,
+    FileSizeBalancing,
 }
 
 impl FromStr for PartitioningStrategy {
@@ -149,6 +157,7 @@ impl FromStr for PartitioningStrategy {
     fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
         match value {
             "adaptive_hash_salt" => Ok(Self::AdaptiveHashSalt),
+            "file_size_balancing" => Ok(Self::FileSizeBalancing),
             _ => Err(ConfigValidationError::InvalidStrategyName {
                 value: value.to_string(),
             }),
@@ -192,6 +201,7 @@ struct RawConfig {
     dataset: RawDatasetConfig,
     partitioning: RawPartitioningConfig,
     statistics: Option<RawStatisticsConfig>,
+    storage: Option<RawStorageConfig>,
     output: Option<RawOutputConfig>,
     job: JobConfig,
     resources: RawResourceConfig,
@@ -221,6 +231,12 @@ struct RawPartitioningConfig {
 struct RawStatisticsConfig {
     heavy_hitter_mode: Option<HeavyHitterMode>,
     approximate_capacity: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawStorageConfig {
+    target_file_size_mb: Option<u64>,
+    min_file_size_mb: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -291,6 +307,7 @@ impl TryFrom<RawConfig> for Config {
 
         let strategy = PartitioningStrategy::from_str(raw.partitioning.strategy.as_str())?;
         let statistics = statistics_config(raw.statistics)?;
+        let storage = storage_config(raw.storage)?;
         let output = output_config(raw.output);
 
         let config = Config {
@@ -311,6 +328,7 @@ impl TryFrom<RawConfig> for Config {
                 seed: raw.partitioning.seed,
             },
             statistics,
+            storage,
             output,
             job: raw.job,
             resources: ResourceConfig {
@@ -339,6 +357,30 @@ fn statistics_config(
     Ok(StatisticsConfig {
         heavy_hitter_mode: raw.heavy_hitter_mode.unwrap_or(HeavyHitterMode::Exact),
         approximate_capacity,
+    })
+}
+
+fn storage_config(
+    raw: Option<RawStorageConfig>,
+) -> std::result::Result<StorageConfig, ConfigValidationError> {
+    let raw = raw.unwrap_or(RawStorageConfig {
+        target_file_size_mb: None,
+        min_file_size_mb: None,
+    });
+    let target = raw.target_file_size_mb.unwrap_or(128);
+    let min = raw.min_file_size_mb.unwrap_or(16);
+    let target_file_size_mb = NonZeroU64::new(target)
+        .ok_or(ConfigValidationError::InvalidTargetFileSize { value: target })?;
+    let min_file_size_mb =
+        NonZeroU64::new(min).ok_or(ConfigValidationError::InvalidMinFileSize { value: min })?;
+
+    if min_file_size_mb > target_file_size_mb {
+        return Err(ConfigValidationError::MinFileSizeGreaterThanTarget { min, target });
+    }
+
+    Ok(StorageConfig {
+        target_file_size_mb,
+        min_file_size_mb,
     })
 }
 
@@ -398,6 +440,8 @@ resources:
         assert_eq!(config.partitioning.no_op_max_imbalance_ratio, 1.2);
         assert_eq!(config.statistics.heavy_hitter_mode, HeavyHitterMode::Exact);
         assert_eq!(config.statistics.approximate_capacity.get(), 10_000);
+        assert_eq!(config.storage.target_file_size_mb.get(), 128);
+        assert_eq!(config.storage.min_file_size_mb.get(), 16);
         assert!(config.output.include_technical_columns);
         assert_eq!(config.output.partition_column, "_rp_partition_id");
         assert_eq!(config.output.salt_column, "_rp_salt");
@@ -507,6 +551,17 @@ resources:
     }
 
     #[test]
+    fn parses_optional_storage_config() {
+        let config = Config::from_yaml_str(&format!(
+            "{EXAMPLE_CONFIG}\nstorage:\n  target_file_size_mb: 64\n  min_file_size_mb: 8\n"
+        ))
+        .expect("config with storage controls should parse");
+
+        assert_eq!(config.storage.target_file_size_mb.get(), 64);
+        assert_eq!(config.storage.min_file_size_mb.get(), 8);
+    }
+
+    #[test]
     fn parses_optional_output_config() {
         let config = Config::from_yaml_str(&format!(
             "{EXAMPLE_CONFIG}\noutput:\n  include_technical_columns: false\n  partition_column: \"partition_id\"\n  salt_column: \"salt\"\n  heavy_key_column: \"is_heavy\"\n"
@@ -567,6 +622,21 @@ resources:
         assert_validation_error(
             error,
             ConfigValidationError::InvalidApproximateCapacity { value: 0 },
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_storage_file_sizes() {
+        let error = Config::from_yaml_str(&format!(
+            "{EXAMPLE_CONFIG}\nstorage:\n  target_file_size_mb: 16\n  min_file_size_mb: 32\n"
+        ))
+        .expect_err("min file size greater than target should be rejected");
+        assert_validation_error(
+            error,
+            ConfigValidationError::MinFileSizeGreaterThanTarget {
+                min: 32,
+                target: 16,
+            },
         );
     }
 
