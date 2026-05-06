@@ -46,6 +46,19 @@ pub fn key_value_to_string(value: &KeyValue) -> Option<String> {
     }
 }
 
+pub fn key_value_type_name(value: &KeyValue) -> &'static str {
+    match value {
+        KeyValue::Null => "null",
+        KeyValue::Utf8(_) => "utf8",
+        KeyValue::Int64(_) => "int64",
+        KeyValue::UInt64(_) => "uint64",
+        KeyValue::Boolean(_) => "boolean",
+        KeyValue::Date32(_) => "date32",
+        KeyValue::TimestampMicros(_) => "timestamp_micros",
+        KeyValue::Decimal(_) => "decimal",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

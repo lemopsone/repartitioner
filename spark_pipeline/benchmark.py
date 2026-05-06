@@ -500,6 +500,43 @@ def is_salt_column(column: str, partition_plan: dict | None) -> bool:
     return column.endswith("_salt") or column in {"_rp_salt", "_ap_salt"}
 
 
+def single_column_heavy_key_literals(
+    partition_plan: dict | None,
+    *,
+    side: str,
+    key_column: str,
+) -> list[dict]:
+    if partition_plan is None:
+        return []
+
+    join_plan = partition_plan.get("join_plan") or {}
+    field_name = f"{side}_heavy_key_values"
+    plan_keys = join_plan.get(field_name) or []
+    literals = []
+    for plan_key in plan_keys:
+        parts = plan_key.get("parts") or []
+        if len(parts) != 1:
+            raise ValueError(
+                "method-aware join currently supports single-column heavy keys only; "
+                f"got {len(parts)} parts for encoded key {plan_key.get('encoded')}"
+            )
+        part = parts[0]
+        if part.get("column") != key_column:
+            raise ValueError(
+                "method-aware join heavy key column does not match benchmark key column; "
+                f"expected {key_column}, got {part.get('column')}"
+            )
+        literals.append(
+            {
+                "column": part.get("column"),
+                "value_type": part.get("value_type"),
+                "value": part.get("value"),
+            }
+        )
+
+    return literals
+
+
 def unique_preserving_order(values: Iterable[str]) -> list[str]:
     unique: list[str] = []
     seen: set[str] = set()

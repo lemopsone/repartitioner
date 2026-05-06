@@ -2,11 +2,13 @@ use std::collections::BTreeMap;
 
 use crate::{
     config::HeavyHitterMode,
+    dataset::Row,
     hashing, heavy_hitters,
+    key_encoding::{key_value_to_string, key_value_type_name},
     manifest::{
         HeavyHitterDetectionMetadata, HeavyKeyPlan, InputFileStats, InputStats, JoinSideStatistics,
-        JoinStatisticsMetadata, PartitionEstimates, ResourceEstimate, SkewStats, StatsMetadata,
-        StorageMetadata, TimingMetadata, METADATA_VERSION,
+        JoinStatisticsMetadata, PartitionEstimates, PlanKey, PlanKeyPart, ResourceEstimate,
+        SkewStats, StatsMetadata, StorageMetadata, TimingMetadata, METADATA_VERSION,
     },
     reader::InputDataset,
     targeting, Config, Error, Result,
@@ -36,6 +38,7 @@ pub fn compute_statistics(config: &Config, dataset: &InputDataset) -> Result<Com
     let file_size_summary = file_size_summary(config, dataset);
     let key_frequency_summary = key_frequency_summary(dataset, config);
     let key_frequencies = key_frequency_summary.frequencies;
+    let key_values = key_value_map(dataset, &config.partitioning.key_columns);
     let mean_key_frequency = mean_frequency(&key_frequencies);
     let max_key_frequency = max_frequency(&key_frequencies);
     let estimated_row_width_bytes = estimated_row_width_bytes(dataset);
@@ -49,7 +52,7 @@ pub fn compute_statistics(config: &Config, dataset: &InputDataset) -> Result<Com
         config.partitioning.heavy_key_alpha,
     )
     .into_iter()
-    .map(heavy_key_plan_placeholder)
+    .map(|heavy| heavy_key_plan_placeholder(heavy, &key_values))
     .collect();
     let heavy_hitters = heavy_hitters::detect_final_heavy_keys(
         &key_frequencies,
@@ -57,7 +60,7 @@ pub fn compute_statistics(config: &Config, dataset: &InputDataset) -> Result<Com
         target_partitioning.target_partition_rows,
     )
     .into_iter()
-    .map(heavy_key_plan_placeholder)
+    .map(|heavy| heavy_key_plan_placeholder(heavy, &key_values))
     .collect();
     let partition_sizes = base_partition_sizes(
         dataset,
@@ -138,6 +141,13 @@ fn join_side_statistics(statistics: &ComputedStatistics) -> JoinSideStatistics {
             .heavy_hitters
             .iter()
             .map(|heavy| heavy.key.clone())
+            .collect(),
+        heavy_key_values: statistics
+            .metadata
+            .input
+            .heavy_hitters
+            .iter()
+            .filter_map(|heavy| heavy.structured_key.clone())
             .collect(),
     }
 }
@@ -241,8 +251,12 @@ fn estimated_dataset_size_mb(dataset: &InputDataset) -> Option<u64> {
     (total_size_bytes > 0).then_some(total_size_bytes.div_ceil(1024 * 1024))
 }
 
-fn heavy_key_plan_placeholder(heavy: heavy_hitters::HeavyHitter) -> HeavyKeyPlan {
+fn heavy_key_plan_placeholder(
+    heavy: heavy_hitters::HeavyHitter,
+    key_values: &BTreeMap<String, PlanKey>,
+) -> HeavyKeyPlan {
     HeavyKeyPlan {
+        structured_key: key_values.get(&heavy.key).cloned(),
         key: heavy.key,
         estimated_frequency: heavy.frequency,
         detection_reasons: heavy.detection_reasons,
@@ -310,6 +324,35 @@ fn key_frequencies(dataset: &InputDataset, key_columns: &[String]) -> BTreeMap<S
     }
 
     frequencies
+}
+
+fn key_value_map(dataset: &InputDataset, key_columns: &[String]) -> BTreeMap<String, PlanKey> {
+    let mut values = BTreeMap::new();
+
+    for row in &dataset.rows.rows {
+        if let Some(key) = row.partition_key(key_columns) {
+            values
+                .entry(key.clone())
+                .or_insert_with(|| plan_key_from_row(row, key_columns, key));
+        }
+    }
+
+    values
+}
+
+fn plan_key_from_row(row: &Row, key_columns: &[String], encoded: String) -> PlanKey {
+    let parts = key_columns
+        .iter()
+        .filter_map(|column| {
+            row.key_values().get(column).map(|value| PlanKeyPart {
+                column: column.clone(),
+                value_type: key_value_type_name(value).to_string(),
+                value: key_value_to_string(value),
+            })
+        })
+        .collect();
+
+    PlanKey { encoded, parts }
 }
 
 fn mean_frequency(key_frequencies: &BTreeMap<String, u64>) -> f64 {

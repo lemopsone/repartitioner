@@ -55,6 +55,13 @@ degraded через `extra.salt_column_used = false`,
 `method_aware`, а `correctness` показывает совпадение числа строк и числа групп
 с baseline.
 
+Для join-aware режимов heavy keys берутся из структурированных metadata полей
+`join_plan.left_heavy_key_values`, `right_heavy_key_values` и
+`shared_heavy_key_values`. Старые encoded поля сохраняются, но benchmark не
+должен парсить их вручную. Composite heavy keys в method-aware join должны
+обрабатываться отдельной логикой; single-column helper явно сообщает об ошибке,
+если получает несколько частей ключа.
+
 Только groupBy:
 
 ```bash

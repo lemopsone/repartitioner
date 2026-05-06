@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -8,8 +8,8 @@ use crate::{
     hashing, heavy_hitters,
     manifest::{
         CostEstimate, HeavyKeyPlan, JoinPlan, NormalKeyPlan, PartitionPlan,
-        PartitionPlanFeasibility, PlanAction, RecommendedDownstreamPlan, SaltPartitionPlan,
-        TechnicalColumns, METADATA_VERSION,
+        PartitionPlanFeasibility, PlanAction, PlanKey, RecommendedDownstreamPlan,
+        SaltPartitionPlan, TechnicalColumns, METADATA_VERSION,
     },
     statistics::ComputedStatistics,
     targeting, Config, Result,
@@ -37,6 +37,7 @@ pub fn build_plan(config: &Config, statistics: &ComputedStatistics) -> Result<Pl
         .iter()
         .map(|heavy| heavy.key.as_str())
         .collect();
+    let structured_keys = structured_key_map(statistics);
 
     let mut estimated_partition_loads = vec![0_u64; output_partitions];
     let normal_keys = statistics
@@ -85,6 +86,7 @@ pub fn build_plan(config: &Config, statistics: &ComputedStatistics) -> Result<Pl
 
         heavy_keys.push(HeavyKeyPlan {
             key: heavy.key.clone(),
+            structured_key: structured_keys.get(&heavy.key).cloned(),
             estimated_frequency: heavy.frequency,
             detection_reasons: heavy.detection_reasons,
             salt_count,
@@ -157,6 +159,21 @@ fn join_plan(config: &Config, statistics: &ComputedStatistics) -> Option<JoinPla
         .filter(|key| right_heavy_set.contains(key))
         .cloned()
         .collect::<Vec<_>>();
+    let left_heavy_key_values = join_stats.left.heavy_key_values.clone();
+    let right_heavy_key_values = join_stats
+        .right
+        .as_ref()
+        .map(|right| right.heavy_key_values.clone())
+        .unwrap_or_default();
+    let right_structured_key_set = right_heavy_key_values
+        .iter()
+        .map(|key| key.encoded.as_str())
+        .collect::<HashSet<_>>();
+    let shared_heavy_key_values = left_heavy_key_values
+        .iter()
+        .filter(|key| right_structured_key_set.contains(key.encoded.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
     let right_side_size_mb = join_stats
         .right
         .as_ref()
@@ -179,10 +196,29 @@ fn join_plan(config: &Config, statistics: &ComputedStatistics) -> Option<JoinPla
         left_heavy_keys,
         right_heavy_keys,
         shared_heavy_keys,
+        left_heavy_key_values,
+        right_heavy_key_values,
+        shared_heavy_key_values,
         recommended_strategy: recommended_strategy.to_string(),
         right_side_size_mb,
         broadcast_threshold_mb: Some(join.broadcast_threshold_mb),
     })
+}
+
+fn structured_key_map(statistics: &ComputedStatistics) -> BTreeMap<String, PlanKey> {
+    statistics
+        .metadata
+        .input
+        .heavy_hitters
+        .iter()
+        .chain(statistics.metadata.input.heavy_hitter_candidates.iter())
+        .filter_map(|heavy| {
+            heavy
+                .structured_key
+                .clone()
+                .map(|structured| (heavy.key.clone(), structured))
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -481,7 +517,8 @@ fn creation_timestamp() -> String {
 mod tests {
     use crate::{
         config::DatasetFormat,
-        dataset::Dataset,
+        dataset::{Dataset, Row},
+        key_encoding::KeyValue,
         manifest::PlanAction,
         reader::{InputDataset, InputFile},
         statistics::{build_join_statistics, compute_statistics},
@@ -518,6 +555,96 @@ mod tests {
             .salt_partitions
             .iter()
             .all(|salt| salt.partition_id < plan.metadata.output_partitions));
+    }
+
+    #[test]
+    fn heavy_key_plan_contains_structured_string_key() {
+        let config = example_config();
+        let dataset = InputDataset::from_rows(Dataset::from_key_values(
+            "user_id",
+            std::iter::repeat_n("heavy", 10).chain(["a", "b", "c", "d"]),
+        ));
+        let statistics = compute_statistics(&config, &dataset).expect("statistics should compute");
+        let plan = build_plan(&config, &statistics).expect("plan should build");
+        let heavy = &plan.metadata.heavy_keys[0];
+        let structured_key = heavy
+            .structured_key
+            .as_ref()
+            .expect("structured key should be present");
+
+        assert_eq!(heavy.key, "7:user_id#utf8:5:heavy");
+        assert_eq!(structured_key.encoded, heavy.key);
+        assert_eq!(structured_key.parts[0].column, "user_id");
+        assert_eq!(structured_key.parts[0].value_type, "utf8");
+        assert_eq!(structured_key.parts[0].value.as_deref(), Some("heavy"));
+    }
+
+    #[test]
+    fn heavy_key_plan_contains_structured_int64_key() {
+        let config = example_config();
+        let rows = std::iter::repeat_n(Row::from_key_value("user_id", KeyValue::Int64(42)), 10)
+            .chain([
+                Row::from_key_value("user_id", KeyValue::Int64(1)),
+                Row::from_key_value("user_id", KeyValue::Int64(2)),
+                Row::from_key_value("user_id", KeyValue::Int64(3)),
+                Row::from_key_value("user_id", KeyValue::Int64(4)),
+            ])
+            .collect();
+        let dataset = InputDataset::from_rows(Dataset::new(rows));
+        let statistics = compute_statistics(&config, &dataset).expect("statistics should compute");
+        let plan = build_plan(&config, &statistics).expect("plan should build");
+        let part = &plan.metadata.heavy_keys[0]
+            .structured_key
+            .as_ref()
+            .unwrap()
+            .parts[0];
+
+        assert_eq!(plan.metadata.heavy_keys[0].key, "7:user_id#int64:42");
+        assert_eq!(part.value_type, "int64");
+        assert_eq!(part.value.as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn heavy_key_plan_represents_null_key() {
+        let config = example_config();
+        let rows = std::iter::repeat_n(Row::from_key_value("user_id", KeyValue::Null), 10)
+            .chain([
+                Row::from_key_value("user_id", KeyValue::Utf8("a".to_string())),
+                Row::from_key_value("user_id", KeyValue::Utf8("b".to_string())),
+                Row::from_key_value("user_id", KeyValue::Utf8("c".to_string())),
+                Row::from_key_value("user_id", KeyValue::Utf8("d".to_string())),
+            ])
+            .collect();
+        let dataset = InputDataset::from_rows(Dataset::new(rows));
+        let statistics = compute_statistics(&config, &dataset).expect("statistics should compute");
+        let plan = build_plan(&config, &statistics).expect("plan should build");
+        let part = &plan.metadata.heavy_keys[0]
+            .structured_key
+            .as_ref()
+            .unwrap()
+            .parts[0];
+
+        assert_eq!(plan.metadata.heavy_keys[0].key, "7:user_id#null");
+        assert_eq!(part.value_type, "null");
+        assert_eq!(part.value, None);
+    }
+
+    #[test]
+    fn encoded_key_field_is_preserved_for_backward_compatibility() {
+        let config = example_config();
+        let dataset = InputDataset::from_rows(Dataset::from_key_values(
+            "user_id",
+            std::iter::repeat_n("heavy", 10).chain(["a", "b", "c", "d"]),
+        ));
+        let statistics = compute_statistics(&config, &dataset).expect("statistics should compute");
+        let plan = build_plan(&config, &statistics).expect("plan should build");
+        let json = serde_json::to_value(&plan.metadata).expect("plan should serialize");
+
+        assert_eq!(
+            json["heavy_keys"][0]["key"].as_str(),
+            Some("7:user_id#utf8:5:heavy")
+        );
+        assert!(json["heavy_keys"][0]["structured_key"].is_object());
     }
 
     #[test]
@@ -919,8 +1046,56 @@ mod tests {
             join_plan.shared_heavy_keys,
             vec!["7:user_id#utf8:5:heavy".to_string()]
         );
+        assert_eq!(join_plan.shared_heavy_key_values.len(), 1);
+        assert_eq!(
+            join_plan.shared_heavy_key_values[0].encoded,
+            "7:user_id#utf8:5:heavy"
+        );
+        assert_eq!(
+            join_plan.shared_heavy_key_values[0].parts[0].column,
+            "user_id"
+        );
+        assert_eq!(
+            join_plan.shared_heavy_key_values[0].parts[0].value_type,
+            "utf8"
+        );
+        assert_eq!(
+            join_plan.shared_heavy_key_values[0].parts[0]
+                .value
+                .as_deref(),
+            Some("heavy")
+        );
         assert_eq!(join_plan.left_heavy_keys.len(), 1);
         assert_eq!(join_plan.right_heavy_keys.len(), 1);
+    }
+
+    #[test]
+    fn join_plan_contains_shared_structured_heavy_keys() {
+        let config = config_with_join(0);
+        let left_dataset = InputDataset::from_rows(Dataset::from_key_values(
+            "user_id",
+            std::iter::repeat_n("heavy", 40).chain(["a", "b", "c", "d"]),
+        ));
+        let right_dataset = input_dataset_with_file_size(
+            Dataset::from_key_values(
+                "user_id",
+                std::iter::repeat_n("heavy", 30).chain(["x", "y"]),
+            ),
+            2 * 1024 * 1024,
+        );
+
+        let plan = build_join_plan(&config, left_dataset, right_dataset);
+        let join_plan = plan.metadata.join_plan.as_ref().unwrap();
+
+        assert_eq!(join_plan.left_heavy_key_values.len(), 1);
+        assert_eq!(join_plan.right_heavy_key_values.len(), 1);
+        assert_eq!(join_plan.shared_heavy_key_values.len(), 1);
+        assert_eq!(
+            join_plan.shared_heavy_key_values[0].parts[0]
+                .value
+                .as_deref(),
+            Some("heavy")
+        );
     }
 
     #[test]

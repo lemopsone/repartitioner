@@ -6,6 +6,7 @@ from spark_pipeline.benchmark import (
     resolve_method_aware_partial_group_keys,
     resolve_method_aware_partition_column,
     resolve_method_aware_salt_column,
+    single_column_heavy_key_literals,
 )
 
 
@@ -65,6 +66,59 @@ class MethodAwareGroupByTests(unittest.TestCase):
         self.assertFalse(extra["salt_column_used"])
         self.assertTrue(extra["method_aware_degraded"])
         self.assertEqual(extra["degraded_reason"], "salt_column_missing")
+
+
+class StructuredHeavyKeyTests(unittest.TestCase):
+    def test_single_column_heavy_key_literals_use_structured_metadata(self) -> None:
+        plan = {
+            "join_plan": {
+                "shared_heavy_key_values": [
+                    {
+                        "encoded": "7:user_id#utf8:5:heavy",
+                        "parts": [
+                            {
+                                "column": "user_id",
+                                "value_type": "utf8",
+                                "value": "heavy",
+                            }
+                        ],
+                    }
+                ]
+            }
+        }
+
+        literals = single_column_heavy_key_literals(
+            plan,
+            side="shared",
+            key_column="user_id",
+        )
+
+        self.assertEqual(
+            literals,
+            [{"column": "user_id", "value_type": "utf8", "value": "heavy"}],
+        )
+
+    def test_composite_heavy_key_literals_are_explicitly_unsupported(self) -> None:
+        plan = {
+            "join_plan": {
+                "shared_heavy_key_values": [
+                    {
+                        "encoded": "composite",
+                        "parts": [
+                            {"column": "user_id", "value_type": "utf8", "value": "heavy"},
+                            {"column": "region", "value_type": "utf8", "value": "eu"},
+                        ],
+                    }
+                ]
+            }
+        }
+
+        with self.assertRaisesRegex(ValueError, "single-column heavy keys only"):
+            single_column_heavy_key_literals(
+                plan,
+                side="shared",
+                key_column="user_id",
+            )
 
 
 if __name__ == "__main__":

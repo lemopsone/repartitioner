@@ -42,9 +42,25 @@ pub struct JoinPlan {
     pub left_heavy_keys: Vec<String>,
     pub right_heavy_keys: Vec<String>,
     pub shared_heavy_keys: Vec<String>,
+    pub left_heavy_key_values: Vec<PlanKey>,
+    pub right_heavy_key_values: Vec<PlanKey>,
+    pub shared_heavy_key_values: Vec<PlanKey>,
     pub recommended_strategy: String,
     pub right_side_size_mb: Option<u64>,
     pub broadcast_threshold_mb: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanKey {
+    pub encoded: String,
+    pub parts: Vec<PlanKeyPart>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanKeyPart {
+    pub column: String,
+    pub value_type: String,
+    pub value: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,6 +118,7 @@ pub struct NormalKeyPlan {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeavyKeyPlan {
     pub key: String,
+    pub structured_key: Option<PlanKey>,
     pub estimated_frequency: u64,
     pub detection_reasons: Vec<HeavyKeyReason>,
     pub salt_count: usize,
@@ -147,6 +164,7 @@ pub struct JoinSideStatistics {
     pub total_size_bytes: Option<u64>,
     pub estimated_size_mb: Option<u64>,
     pub heavy_keys: Vec<String>,
+    pub heavy_key_values: Vec<PlanKey>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -302,6 +320,14 @@ mod tests {
             }],
             heavy_keys: vec![HeavyKeyPlan {
                 key: "42".to_string(),
+                structured_key: Some(PlanKey {
+                    encoded: "42".to_string(),
+                    parts: vec![PlanKeyPart {
+                        column: "user_id".to_string(),
+                        value_type: "int64".to_string(),
+                        value: Some("42".to_string()),
+                    }],
+                }),
                 estimated_frequency: 1000,
                 detection_reasons: vec![HeavyKeyReason::AboveMeanThreshold],
                 salt_count: 3,
