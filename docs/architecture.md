@@ -39,9 +39,20 @@ The crate exposes format-agnostic `DatasetReader` and `DatasetWriter` traits in
 adapter from `dataset.format` and keep the CLI behavior stable.
 
 The current adapter is `io/parquet.rs`. It owns all Arrow/Parquet-specific
-logic: file discovery, Parquet batch reading, Arrow key extraction, retained
-batch rewriting, Hive-style `rp_partition=<id>` output directories, and Parquet
-file writing.
+logic: file discovery, Parquet batch reading, Arrow key extraction, Hive-style
+`rp_partition=<id>` output directories, and Parquet file writing.
+
+Parquet processing is two-pass:
+
+- pass 1 scans only configured key columns using Parquet projection and retains
+  encoded key rows for statistics and planning;
+- pass 2 scans full record batches again and writes output batches directly to
+  lazily opened partition writers.
+
+This means full Arrow `RecordBatch` values are no longer retained in
+`InputDataset` for normal Parquet input. The current prototype still keeps
+encoded keys and row assignments in memory; replacing those structures with a
+fully streaming/state-only planner is a separate optimization.
 
 The method core remains outside the adapter layer:
 
@@ -88,9 +99,10 @@ resources:
 
 ## Resource Guard
 
-The current prototype uses in-memory processing for method statistics and row
-assignment. `resources.memory_limit_mb` is therefore used as an explicit guard
-against unexpectedly large inputs.
+The current prototype uses in-memory processing for encoded keys and row
+assignment. Full Parquet payload batches are streamed during writing, but
+`resources.memory_limit_mb` is still used as an explicit guard against
+unexpectedly large inputs.
 
 During statistics computation the tool estimates dataset size from input file
 sizes and writes a `resources` section to `_stats.json`:

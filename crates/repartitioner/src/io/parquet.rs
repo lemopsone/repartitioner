@@ -8,12 +8,12 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use arrow_select::take::take;
-use parquet::arrow::{arrow_reader::ParquetRecordBatchReaderBuilder, ArrowWriter};
+use parquet::arrow::{arrow_reader::ParquetRecordBatchReaderBuilder, ArrowWriter, ProjectionMask};
 
 use crate::{
     config::DatasetFormat,
     dataset::{Dataset, Row},
-    io::{DatasetReader, DatasetWriter},
+    io::{DatasetReader, DatasetWriter, KeyBatchScanner, RecordBatchScanner},
     key_encoding::{key_value_to_string, KeyValue},
     manifest::{
         Manifest, OutputFile, PartitionManifest, PartitionPlan, StatsMetadata, TechnicalColumns,
@@ -30,11 +30,45 @@ pub struct ParquetDatasetReader;
 
 impl DatasetReader for ParquetDatasetReader {
     fn read_dataset(&self, config: &Config) -> Result<InputDataset> {
+        self.scan_key_batches(config)
+    }
+}
+
+impl KeyBatchScanner for ParquetDatasetReader {
+    fn scan_key_batches(&self, config: &Config) -> Result<InputDataset> {
         inspect_local_input(
             &config.dataset.input,
             DatasetFormat::Parquet,
             &config.partitioning.key_columns,
         )
+    }
+}
+
+impl RecordBatchScanner for ParquetDatasetReader {
+    fn scan_record_batches(
+        &self,
+        dataset: &InputDataset,
+        visitor: &mut dyn FnMut(usize, RecordBatch) -> Result<()>,
+    ) -> Result<()> {
+        let mut batch_start = 0_usize;
+
+        for input_file in &dataset.files {
+            let file = File::open(&input_file.path).map_err(|source| Error::ReadFile {
+                path: input_file.path.clone().into(),
+                source,
+            })?;
+            let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+            let reader = builder.build()?;
+
+            for batch in reader {
+                let batch = batch?;
+                let current_start = batch_start;
+                batch_start += batch.num_rows();
+                visitor(current_start, batch)?;
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -77,14 +111,14 @@ fn inspect_local_input(
         });
     }
 
-    let (rows, batches) = read_parquet_dataset(&files, key_columns)?;
+    let rows = read_parquet_keys(&files, key_columns)?;
 
     Ok(InputDataset {
         path: input.display().to_string(),
         format,
         files,
         rows,
-        batches,
+        batches: Vec::new(),
     })
 }
 
@@ -124,12 +158,8 @@ fn inspect_file(path: &Path) -> Result<InputFile> {
     })
 }
 
-fn read_parquet_dataset(
-    files: &[InputFile],
-    key_columns: &[String],
-) -> Result<(Dataset, Vec<RecordBatch>)> {
+fn read_parquet_keys(files: &[InputFile], key_columns: &[String]) -> Result<Dataset> {
     let mut rows = Vec::new();
-    let mut batches = Vec::new();
 
     for input_file in files {
         let file = File::open(&input_file.path).map_err(|source| Error::ReadFile {
@@ -137,6 +167,11 @@ fn read_parquet_dataset(
             source,
         })?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+        let projection = ProjectionMask::columns(
+            builder.parquet_schema(),
+            key_columns.iter().map(String::as_str),
+        );
+        let builder = builder.with_projection(projection);
         let reader = builder.build()?;
 
         for batch in reader {
@@ -156,11 +191,10 @@ fn read_parquet_dataset(
                 }
                 rows.push(Row::new(key_values));
             }
-            batches.push(batch);
         }
     }
 
-    Ok((Dataset::new(rows), batches))
+    Ok(Dataset::new(rows))
 }
 
 fn key_value(column: &str, array: &dyn Array, row_index: usize) -> Result<KeyValue> {
@@ -319,6 +353,25 @@ fn write_parquet_output(
         source,
     })?;
 
+    let output_files = if !dataset.files.is_empty() && dataset.batches.is_empty() {
+        write_streaming_parquet_output(output_dir, plan, assignments, dataset)?
+    } else {
+        write_retained_parquet_output(output_dir, plan, assignments, dataset)?
+    };
+
+    let manifest = manifest_from_output_files(assignments, output_files);
+
+    write_metadata_files(output_dir, plan, stats, &manifest)?;
+
+    Ok(WriteSummary { manifest })
+}
+
+fn write_retained_parquet_output(
+    output_dir: &Path,
+    plan: &PartitionPlan,
+    assignments: &PartitionAssignmentSummary,
+    dataset: &InputDataset,
+) -> Result<Vec<OutputFile>> {
     let mut assignments_by_partition = vec![Vec::new(); plan.output_partitions];
     for record in &assignments.records {
         if record.partition_id < assignments_by_partition.len() {
@@ -351,6 +404,155 @@ fn write_parquet_output(
         });
     }
 
+    Ok(output_files)
+}
+
+fn write_streaming_parquet_output(
+    output_dir: &Path,
+    plan: &PartitionPlan,
+    assignments: &PartitionAssignmentSummary,
+    dataset: &InputDataset,
+) -> Result<Vec<OutputFile>> {
+    let mut open_writers = BTreeMap::<usize, OpenPartitionWriter>::new();
+    let scanner = ParquetDatasetReader;
+
+    scanner.scan_record_batches(dataset, &mut |batch_start, batch| {
+        write_streamed_batch(
+            output_dir,
+            plan,
+            assignments,
+            batch_start,
+            batch,
+            &mut open_writers,
+        )
+    })?;
+
+    let mut output_files = Vec::new();
+    for (partition_id, open_writer) in open_writers {
+        open_writer.writer.close()?;
+        let file_path = output_dir.join(&open_writer.relative_path);
+        let size_bytes = fs::metadata(&file_path).ok().map(|metadata| metadata.len());
+        output_files.push(OutputFile {
+            path: open_writer.relative_path,
+            partition_id,
+            row_count: open_writer.row_count,
+            size_bytes,
+        });
+    }
+
+    Ok(output_files)
+}
+
+struct OpenPartitionWriter {
+    writer: ArrowWriter<File>,
+    relative_path: String,
+    row_count: u64,
+}
+
+fn write_streamed_batch(
+    output_dir: &Path,
+    plan: &PartitionPlan,
+    assignments: &PartitionAssignmentSummary,
+    batch_start: usize,
+    batch: RecordBatch,
+    open_writers: &mut BTreeMap<usize, OpenPartitionWriter>,
+) -> Result<()> {
+    let batch_assignments = batch_assignments(assignments, batch_start, batch.num_rows())?;
+    let mut local_by_partition = BTreeMap::<usize, Vec<(u32, RecordPartitionAssignment)>>::new();
+
+    for (local_index, assignment) in batch_assignments.iter().enumerate() {
+        if assignment.row_index != batch_start + local_index {
+            return Err(Error::MissingRetainedRow {
+                row_index: batch_start + local_index,
+            });
+        }
+        local_by_partition
+            .entry(assignment.partition_id)
+            .or_default()
+            .push((local_index as u32, assignment.clone()));
+    }
+
+    for (partition_id, rows) in local_by_partition {
+        if partition_id >= plan.output_partitions {
+            continue;
+        }
+
+        let local_indexes = rows
+            .iter()
+            .map(|(local_index, _)| *local_index)
+            .collect::<Vec<_>>();
+        let local_assignments = rows
+            .into_iter()
+            .map(|(_, assignment)| assignment)
+            .collect::<Vec<_>>();
+        let output_batch = take_batch(&batch, &local_indexes)?;
+        let output_batch =
+            append_technical_columns(output_batch, &local_assignments, &plan.technical_columns)?;
+        let row_count = output_batch.num_rows() as u64;
+        let writer = partition_writer(
+            output_dir,
+            partition_id,
+            output_batch.schema(),
+            open_writers,
+        )?;
+        writer.writer.write(&output_batch)?;
+        writer.row_count += row_count;
+    }
+
+    Ok(())
+}
+
+fn batch_assignments(
+    assignments: &PartitionAssignmentSummary,
+    batch_start: usize,
+    batch_rows: usize,
+) -> Result<&[RecordPartitionAssignment]> {
+    let batch_end = batch_start + batch_rows;
+    assignments
+        .records
+        .get(batch_start..batch_end)
+        .ok_or(Error::MissingRetainedRow {
+            row_index: batch_start,
+        })
+}
+
+fn partition_writer<'a>(
+    output_dir: &Path,
+    partition_id: usize,
+    schema: Arc<Schema>,
+    open_writers: &'a mut BTreeMap<usize, OpenPartitionWriter>,
+) -> Result<&'a mut OpenPartitionWriter> {
+    match open_writers.entry(partition_id) {
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            let relative_path =
+                format!("rp_partition={partition_id}/part-{partition_id:05}.parquet");
+            let file_path = output_dir.join(&relative_path);
+            if let Some(parent) = file_path.parent() {
+                fs::create_dir_all(parent).map_err(|source| Error::WriteFile {
+                    path: parent.to_path_buf(),
+                    source,
+                })?;
+            }
+
+            let file = File::create(&file_path).map_err(|source| Error::WriteFile {
+                path: file_path,
+                source,
+            })?;
+            let writer = ArrowWriter::try_new(file, schema, None)?;
+            Ok(entry.insert(OpenPartitionWriter {
+                writer,
+                relative_path,
+                row_count: 0,
+            }))
+        }
+        std::collections::btree_map::Entry::Occupied(entry) => Ok(entry.into_mut()),
+    }
+}
+
+fn manifest_from_output_files(
+    assignments: &PartitionAssignmentSummary,
+    output_files: Vec<OutputFile>,
+) -> Manifest {
     let partitions = assignments
         .partition_row_counts
         .iter()
@@ -374,17 +576,13 @@ fn write_parquet_output(
         })
         .collect();
 
-    let manifest = Manifest {
+    Manifest {
         version: METADATA_VERSION.to_string(),
         input_reused: false,
         dataset_location: None,
         output_files,
         partitions,
-    };
-
-    write_metadata_files(output_dir, plan, stats, &manifest)?;
-
-    Ok(WriteSummary { manifest })
+    }
 }
 
 fn write_partition_parquet(

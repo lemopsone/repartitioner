@@ -1,5 +1,7 @@
 use std::path::Path;
 
+use arrow_array::RecordBatch;
+
 use crate::{
     manifest::{PartitionPlan, StatsMetadata},
     partitioner::PartitionAssignmentSummary,
@@ -13,6 +15,18 @@ pub mod parquet;
 
 pub trait DatasetReader {
     fn read_dataset(&self, config: &Config) -> Result<InputDataset>;
+}
+
+pub trait KeyBatchScanner {
+    fn scan_key_batches(&self, config: &Config) -> Result<InputDataset>;
+}
+
+pub trait RecordBatchScanner {
+    fn scan_record_batches(
+        &self,
+        dataset: &InputDataset,
+        visitor: &mut dyn FnMut(usize, RecordBatch) -> Result<()>,
+    ) -> Result<()>;
 }
 
 pub trait DatasetWriter {
