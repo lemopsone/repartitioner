@@ -17,6 +17,7 @@ pub struct Config {
     pub storage: StorageConfig,
     pub output: OutputConfig,
     pub job: JobConfig,
+    pub join: Option<JoinConfig>,
     pub resources: ResourceConfig,
 }
 
@@ -172,6 +173,22 @@ pub struct JobConfig {
     pub downstream_engine: DownstreamEngine,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct JoinConfig {
+    pub left_input: PathBuf,
+    pub right_input: PathBuf,
+    pub join_keys: Vec<String>,
+    pub right_side_mode: RightSideMode,
+    pub broadcast_threshold_mb: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RightSideMode {
+    BroadcastIfSmall,
+    Shuffle,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobType {
@@ -204,6 +221,7 @@ struct RawConfig {
     storage: Option<RawStorageConfig>,
     output: Option<RawOutputConfig>,
     job: JobConfig,
+    join: Option<RawJoinConfig>,
     resources: RawResourceConfig,
 }
 
@@ -245,6 +263,15 @@ struct RawOutputConfig {
     partition_column: Option<String>,
     salt_column: Option<String>,
     heavy_key_column: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawJoinConfig {
+    left_input: Option<String>,
+    right_input: String,
+    join_keys: Vec<String>,
+    right_side_mode: Option<RightSideMode>,
+    broadcast_threshold_mb: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -312,7 +339,7 @@ impl TryFrom<RawConfig> for Config {
 
         let config = Config {
             dataset: DatasetConfig {
-                input: PathBuf::from(raw.dataset.input),
+                input: PathBuf::from(raw.dataset.input.clone()),
                 output: PathBuf::from(raw.dataset.output),
                 format: raw.dataset.format,
             },
@@ -331,6 +358,7 @@ impl TryFrom<RawConfig> for Config {
             storage,
             output,
             job: raw.job,
+            join: join_config(raw.join, &raw.dataset.input)?,
             resources: ResourceConfig {
                 local_threads: raw.resources.local_threads,
                 memory_limit_mb: raw.resources.memory_limit_mb,
@@ -358,6 +386,34 @@ fn statistics_config(
         heavy_hitter_mode: raw.heavy_hitter_mode.unwrap_or(HeavyHitterMode::Exact),
         approximate_capacity,
     })
+}
+
+fn join_config(
+    raw: Option<RawJoinConfig>,
+    default_left_input: &str,
+) -> std::result::Result<Option<JoinConfig>, ConfigValidationError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    if raw.right_input.trim().is_empty() {
+        return Err(ConfigValidationError::MissingJoinRightInput);
+    }
+    if raw.join_keys.iter().all(|key| key.trim().is_empty()) {
+        return Err(ConfigValidationError::MissingJoinKeys);
+    }
+
+    Ok(Some(JoinConfig {
+        left_input: PathBuf::from(
+            raw.left_input
+                .unwrap_or_else(|| default_left_input.to_string()),
+        ),
+        right_input: PathBuf::from(raw.right_input),
+        join_keys: raw.join_keys,
+        right_side_mode: raw
+            .right_side_mode
+            .unwrap_or(RightSideMode::BroadcastIfSmall),
+        broadcast_threshold_mb: raw.broadcast_threshold_mb.unwrap_or(10),
+    }))
 }
 
 fn storage_config(
@@ -452,6 +508,7 @@ resources:
         );
         assert_eq!(config.job.job_type, JobType::GroupBy);
         assert_eq!(config.job.downstream_engine, DownstreamEngine::Spark);
+        assert!(config.join.is_none());
         assert_eq!(config.resources.local_threads, 8);
         assert_eq!(config.resources.memory_limit_mb, 4096);
         assert!(!config.resources.fail_on_memory_limit);
@@ -572,6 +629,52 @@ resources:
         assert_eq!(config.output.partition_column, "partition_id");
         assert_eq!(config.output.salt_column, "salt");
         assert_eq!(config.output.heavy_key_column, "is_heavy");
+    }
+
+    #[test]
+    fn parses_optional_join_config() {
+        let config = Config::from_yaml_str(&format!(
+            "{EXAMPLE_CONFIG}\njoin:\n  left_input: \"./data/left\"\n  right_input: \"./data/right\"\n  join_keys: [\"user_id\"]\n  right_side_mode: \"broadcast_if_small\"\n  broadcast_threshold_mb: 10\n"
+        ))
+        .expect("config with join controls should parse");
+
+        let join = config.join.expect("join config should be present");
+        assert_eq!(join.left_input, PathBuf::from("./data/left"));
+        assert_eq!(join.right_input, PathBuf::from("./data/right"));
+        assert_eq!(join.join_keys, vec!["user_id".to_string()]);
+        assert_eq!(join.right_side_mode, RightSideMode::BroadcastIfSmall);
+        assert_eq!(join.broadcast_threshold_mb, 10);
+    }
+
+    #[test]
+    fn join_config_defaults_left_input_to_dataset_input() {
+        let config = Config::from_yaml_str(&format!(
+            "{EXAMPLE_CONFIG}\njoin:\n  right_input: \"./data/right\"\n  join_keys: [\"user_id\"]\n"
+        ))
+        .expect("config with minimal join controls should parse");
+
+        let join = config.join.expect("join config should be present");
+        assert_eq!(join.left_input, PathBuf::from("./data/input.parquet"));
+        assert_eq!(join.right_side_mode, RightSideMode::BroadcastIfSmall);
+        assert_eq!(join.broadcast_threshold_mb, 10);
+    }
+
+    #[test]
+    fn rejects_missing_join_right_input() {
+        let error = Config::from_yaml_str(&format!(
+            "{EXAMPLE_CONFIG}\njoin:\n  right_input: \"\"\n  join_keys: [\"user_id\"]\n"
+        ))
+        .expect_err("empty join right input should be rejected");
+        assert_validation_error(error, ConfigValidationError::MissingJoinRightInput);
+    }
+
+    #[test]
+    fn rejects_missing_join_keys() {
+        let error = Config::from_yaml_str(&format!(
+            "{EXAMPLE_CONFIG}\njoin:\n  right_input: \"./data/right\"\n  join_keys: []\n"
+        ))
+        .expect_err("empty join keys should be rejected");
+        assert_validation_error(error, ConfigValidationError::MissingJoinKeys);
     }
 
     #[test]

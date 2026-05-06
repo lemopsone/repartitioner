@@ -4,9 +4,9 @@ use crate::{
     config::HeavyHitterMode,
     hashing, heavy_hitters,
     manifest::{
-        HeavyHitterDetectionMetadata, HeavyKeyPlan, InputFileStats, InputStats, PartitionEstimates,
-        ResourceEstimate, SkewStats, StatsMetadata, StorageMetadata, TimingMetadata,
-        METADATA_VERSION,
+        HeavyHitterDetectionMetadata, HeavyKeyPlan, InputFileStats, InputStats, JoinSideStatistics,
+        JoinStatisticsMetadata, PartitionEstimates, ResourceEstimate, SkewStats, StatsMetadata,
+        StorageMetadata, TimingMetadata, METADATA_VERSION,
     },
     reader::InputDataset,
     targeting, Config, Error, Result,
@@ -24,6 +24,10 @@ impl ComputedStatistics {
 
     pub fn set_timing(&mut self, timing: TimingMetadata) {
         self.metadata.timing = Some(timing);
+    }
+
+    pub fn set_join_statistics(&mut self, join: JoinStatisticsMetadata) {
+        self.metadata.join = Some(join);
     }
 }
 
@@ -96,6 +100,7 @@ pub fn compute_statistics(config: &Config, dataset: &InputDataset) -> Result<Com
             target_file_size_bytes: mb_to_bytes(config.storage.target_file_size_mb.get()),
             min_file_size_bytes: mb_to_bytes(config.storage.min_file_size_mb.get()),
         },
+        join: None,
         skew,
         estimates: PartitionEstimates {
             target_partitions: target_partitioning.output_partitions,
@@ -107,6 +112,40 @@ pub fn compute_statistics(config: &Config, dataset: &InputDataset) -> Result<Com
     };
 
     Ok(ComputedStatistics { metadata })
+}
+
+pub fn build_join_statistics(
+    join_keys: Vec<String>,
+    left: &ComputedStatistics,
+    right: Option<&ComputedStatistics>,
+) -> JoinStatisticsMetadata {
+    JoinStatisticsMetadata {
+        join_keys,
+        left: join_side_statistics(left),
+        right: right.map(join_side_statistics),
+    }
+}
+
+fn join_side_statistics(statistics: &ComputedStatistics) -> JoinSideStatistics {
+    let total_size_bytes = total_input_size_bytes(&statistics.metadata.input.input_files);
+    JoinSideStatistics {
+        total_rows: statistics.metadata.input.total_rows,
+        total_size_bytes,
+        estimated_size_mb: total_size_bytes.map(|bytes| bytes.div_ceil(1024 * 1024)),
+        heavy_keys: statistics
+            .metadata
+            .input
+            .heavy_hitters
+            .iter()
+            .map(|heavy| heavy.key.clone())
+            .collect(),
+    }
+}
+
+fn total_input_size_bytes(input_files: &[InputFileStats]) -> Option<u64> {
+    let total = input_files.iter().map(|file| file.size_bytes).sum::<u64>();
+
+    (total > 0).then_some(total)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

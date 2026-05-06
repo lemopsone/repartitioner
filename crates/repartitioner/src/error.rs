@@ -92,6 +92,12 @@ pub enum ConfigValidationError {
     #[error("statistics.approximate_capacity must be greater than zero, got {value}")]
     InvalidApproximateCapacity { value: usize },
 
+    #[error("join.right_input must not be empty")]
+    MissingJoinRightInput,
+
+    #[error("join.join_keys must contain at least one non-empty column name")]
+    MissingJoinKeys,
+
     #[error("storage.target_file_size_mb must be greater than zero, got {value}")]
     InvalidTargetFileSize { value: u64 },
 

@@ -17,7 +17,8 @@ fn main() -> ExitCode {
 
 fn run(args: CliArgs) -> Result<()> {
     let total_started = Instant::now();
-    let config = args.load_config()?;
+    let mut config = args.load_config()?;
+    apply_join_inputs(&mut config);
 
     let read_started = Instant::now();
     let dataset = reader::read_dataset(&config)?;
@@ -25,6 +26,7 @@ fn run(args: CliArgs) -> Result<()> {
 
     let statistics_started = Instant::now();
     let mut statistics = statistics::compute_statistics(&config, &dataset)?;
+    attach_join_statistics(&config, &mut statistics)?;
     let statistics_seconds = elapsed_seconds(statistics_started);
 
     let planning_started = Instant::now();
@@ -94,4 +96,43 @@ fn run(args: CliArgs) -> Result<()> {
 
 fn elapsed_seconds(started: Instant) -> f64 {
     started.elapsed().as_secs_f64()
+}
+
+fn apply_join_inputs(config: &mut repartitioner::Config) {
+    if config.job.job_type != repartitioner::config::JobType::Join {
+        return;
+    }
+
+    let Some(join_config) = &config.join else {
+        return;
+    };
+
+    config.dataset.input = join_config.left_input.clone();
+    config.partitioning.key_columns = join_config.join_keys.clone();
+}
+
+fn attach_join_statistics(
+    config: &repartitioner::Config,
+    computed_statistics: &mut statistics::ComputedStatistics,
+) -> Result<()> {
+    if config.job.job_type != repartitioner::config::JobType::Join {
+        return Ok(());
+    }
+
+    let Some(join_config) = &config.join else {
+        return Ok(());
+    };
+
+    let mut right_config = config.clone();
+    right_config.dataset.input = join_config.right_input.clone();
+    right_config.partitioning.key_columns = join_config.join_keys.clone();
+    let right_dataset = reader::read_dataset(&right_config)?;
+    let right_statistics = statistics::compute_statistics(&right_config, &right_dataset)?;
+    computed_statistics.set_join_statistics(statistics::build_join_statistics(
+        join_config.join_keys.clone(),
+        computed_statistics,
+        Some(&right_statistics),
+    ));
+
+    Ok(())
 }

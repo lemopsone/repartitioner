@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashSet},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -7,9 +7,9 @@ use crate::{
     config::JobType,
     hashing, heavy_hitters,
     manifest::{
-        CostEstimate, HeavyKeyPlan, NormalKeyPlan, PartitionPlan, PartitionPlanFeasibility,
-        PlanAction, RecommendedDownstreamPlan, SaltPartitionPlan, TechnicalColumns,
-        METADATA_VERSION,
+        CostEstimate, HeavyKeyPlan, JoinPlan, NormalKeyPlan, PartitionPlan,
+        PartitionPlanFeasibility, PlanAction, RecommendedDownstreamPlan, SaltPartitionPlan,
+        TechnicalColumns, METADATA_VERSION,
     },
     statistics::ComputedStatistics,
     targeting, Config, Result,
@@ -127,11 +127,59 @@ pub fn build_plan(config: &Config, statistics: &ComputedStatistics) -> Result<Pl
             normal_keys,
             heavy_keys,
             recommended_downstream_plan: recommended_downstream_plan(config),
+            join_plan: join_plan(config, statistics),
             cost_estimate,
             skip_reason: rewrite_decision.skip_reason,
             hash_function: hashing::HASH_FUNCTION_NAME.to_string(),
             seed: config.partitioning.seed,
         },
+    })
+}
+
+fn join_plan(config: &Config, statistics: &ComputedStatistics) -> Option<JoinPlan> {
+    if config.job.job_type != JobType::Join {
+        return None;
+    }
+
+    let join = config.join.as_ref()?;
+    let join_stats = statistics.metadata.join.as_ref()?;
+    let left_heavy_keys = join_stats.left.heavy_keys.clone();
+    let right_heavy_keys = join_stats
+        .right
+        .as_ref()
+        .map(|right| right.heavy_keys.clone())
+        .unwrap_or_default();
+    let right_heavy_set = right_heavy_keys.iter().collect::<HashSet<_>>();
+    let shared_heavy_keys = left_heavy_keys
+        .iter()
+        .filter(|key| right_heavy_set.contains(key))
+        .cloned()
+        .collect::<Vec<_>>();
+    let right_side_size_mb = join_stats
+        .right
+        .as_ref()
+        .and_then(|right| right.estimated_size_mb);
+    let right_is_broadcastable = join.right_side_mode
+        == crate::config::RightSideMode::BroadcastIfSmall
+        && right_side_size_mb.is_some_and(|size_mb| size_mb <= join.broadcast_threshold_mb);
+
+    let recommended_strategy = if right_is_broadcastable {
+        "broadcast_join_recommendation"
+    } else if !shared_heavy_keys.is_empty() {
+        "salted_heavy_key_join"
+    } else if !left_heavy_keys.is_empty() || !right_heavy_keys.is_empty() {
+        "heavy_key_isolation_join"
+    } else {
+        "physical_only"
+    };
+
+    Some(JoinPlan {
+        left_heavy_keys,
+        right_heavy_keys,
+        shared_heavy_keys,
+        recommended_strategy: recommended_strategy.to_string(),
+        right_side_size_mb,
+        broadcast_threshold_mb: Some(join.broadcast_threshold_mb),
     })
 }
 
@@ -373,7 +421,7 @@ mod tests {
         dataset::Dataset,
         manifest::PlanAction,
         reader::{InputDataset, InputFile},
-        statistics::compute_statistics,
+        statistics::{build_join_statistics, compute_statistics},
         targeting,
         tests::example_config,
         Config,
@@ -717,6 +765,108 @@ mod tests {
     }
 
     #[test]
+    fn join_plan_recommends_broadcast_for_small_right_side() {
+        let config = config_with_join(10);
+        let left_dataset =
+            InputDataset::from_rows(Dataset::from_key_values("user_id", ["a", "b", "c", "d"]));
+        let right_dataset = input_dataset_with_file_size(
+            Dataset::from_key_values("user_id", ["a", "b"]),
+            2 * 1024 * 1024,
+        );
+
+        let plan = build_join_plan(&config, left_dataset, right_dataset);
+        let join_plan = plan
+            .metadata
+            .join_plan
+            .expect("join plan should be present");
+
+        assert_eq!(
+            join_plan.recommended_strategy,
+            "broadcast_join_recommendation"
+        );
+        assert_eq!(join_plan.right_side_size_mb, Some(2));
+        assert_eq!(join_plan.broadcast_threshold_mb, Some(10));
+    }
+
+    #[test]
+    fn join_plan_uses_shared_heavy_keys_from_both_sides() {
+        let config = config_with_join(0);
+        let left_dataset = InputDataset::from_rows(Dataset::from_key_values(
+            "user_id",
+            std::iter::repeat_n("heavy", 40).chain(["a", "b", "c", "d"]),
+        ));
+        let right_dataset = input_dataset_with_file_size(
+            Dataset::from_key_values(
+                "user_id",
+                std::iter::repeat_n("heavy", 30).chain(["x", "y"]),
+            ),
+            2 * 1024 * 1024,
+        );
+
+        let plan = build_join_plan(&config, left_dataset, right_dataset);
+        let join_plan = plan
+            .metadata
+            .join_plan
+            .expect("join plan should be present");
+
+        assert_eq!(join_plan.recommended_strategy, "salted_heavy_key_join");
+        assert_eq!(
+            join_plan.shared_heavy_keys,
+            vec!["7:user_id#utf8:5:heavy".to_string()]
+        );
+        assert_eq!(join_plan.left_heavy_keys.len(), 1);
+        assert_eq!(join_plan.right_heavy_keys.len(), 1);
+    }
+
+    #[test]
+    fn join_plan_recommends_heavy_key_isolation_for_one_sided_heavy_key() {
+        let config = config_with_join(0);
+        let left_dataset = InputDataset::from_rows(Dataset::from_key_values(
+            "user_id",
+            std::iter::repeat_n("heavy", 40).chain(["a", "b", "c", "d"]),
+        ));
+        let right_dataset = input_dataset_with_file_size(
+            Dataset::from_key_values("user_id", (0..40).map(|index| format!("right_{index}"))),
+            2 * 1024 * 1024,
+        );
+
+        let plan = build_join_plan(&config, left_dataset, right_dataset);
+        let join_plan = plan
+            .metadata
+            .join_plan
+            .expect("join plan should be present");
+
+        assert_eq!(join_plan.recommended_strategy, "heavy_key_isolation_join");
+        assert!(join_plan.shared_heavy_keys.is_empty());
+        assert_eq!(join_plan.left_heavy_keys.len(), 1);
+        assert!(join_plan.right_heavy_keys.is_empty());
+    }
+
+    #[test]
+    fn join_plan_recommends_physical_only_without_broadcast_or_heavy_keys() {
+        let config = config_with_join(0);
+        let left_dataset = InputDataset::from_rows(Dataset::from_key_values(
+            "user_id",
+            (0..40).map(|index| format!("left_{index}")),
+        ));
+        let right_dataset = input_dataset_with_file_size(
+            Dataset::from_key_values("user_id", (0..40).map(|index| format!("right_{index}"))),
+            2 * 1024 * 1024,
+        );
+
+        let plan = build_join_plan(&config, left_dataset, right_dataset);
+        let join_plan = plan
+            .metadata
+            .join_plan
+            .expect("join plan should be present");
+
+        assert_eq!(join_plan.recommended_strategy, "physical_only");
+        assert!(join_plan.left_heavy_keys.is_empty());
+        assert!(join_plan.right_heavy_keys.is_empty());
+        assert!(join_plan.shared_heavy_keys.is_empty());
+    }
+
+    #[test]
     fn scan_plan_does_not_require_operator_rewrite() {
         let config = config_with_job_type("scan");
         let plan = build_plan_for_job_config(&config);
@@ -838,6 +988,41 @@ resources:
         .expect("test config should parse")
     }
 
+    fn config_with_join(broadcast_threshold_mb: u64) -> Config {
+        Config::from_yaml_str(&format!(
+            r#"
+dataset:
+  input: "./data/left.parquet"
+  output: "./data/output_partitioned"
+  format: "parquet"
+
+partitioning:
+  key_columns: ["user_id"]
+  target_partition_size_mb: 128
+  max_partitions: 4
+  strategy: "adaptive_hash_salt"
+  heavy_key_alpha: 2.0
+  seed: 42
+
+job:
+  type: "join"
+  downstream_engine: "spark"
+
+join:
+  left_input: "./data/left.parquet"
+  right_input: "./data/right.parquet"
+  join_keys: ["user_id"]
+  right_side_mode: "broadcast_if_small"
+  broadcast_threshold_mb: {broadcast_threshold_mb}
+
+resources:
+  local_threads: 8
+  memory_limit_mb: 4096
+"#
+        ))
+        .expect("join test config should parse")
+    }
+
     fn build_plan_for_job_config(config: &Config) -> Plan {
         let dataset = InputDataset::from_rows(Dataset::from_key_values(
             "user_id",
@@ -845,6 +1030,24 @@ resources:
         ));
         let statistics = compute_statistics(config, &dataset).expect("statistics should compute");
         build_plan(config, &statistics).expect("plan should build")
+    }
+
+    fn build_join_plan(
+        config: &Config,
+        left_dataset: InputDataset,
+        right_dataset: InputDataset,
+    ) -> Plan {
+        let mut left_statistics =
+            compute_statistics(config, &left_dataset).expect("left statistics should compute");
+        let right_statistics =
+            compute_statistics(config, &right_dataset).expect("right statistics should compute");
+        left_statistics.set_join_statistics(build_join_statistics(
+            config.join.as_ref().unwrap().join_keys.clone(),
+            &left_statistics,
+            Some(&right_statistics),
+        ));
+
+        build_plan(config, &left_statistics).expect("join plan should build")
     }
 
     fn input_dataset_with_file_size(rows: Dataset, size_bytes: u64) -> InputDataset {

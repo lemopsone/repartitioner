@@ -30,10 +30,21 @@ pub struct PartitionPlan {
     pub normal_keys: Vec<NormalKeyPlan>,
     pub heavy_keys: Vec<HeavyKeyPlan>,
     pub recommended_downstream_plan: RecommendedDownstreamPlan,
+    pub join_plan: Option<JoinPlan>,
     pub cost_estimate: CostEstimate,
     pub skip_reason: Option<String>,
     pub hash_function: String,
     pub seed: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JoinPlan {
+    pub left_heavy_keys: Vec<String>,
+    pub right_heavy_keys: Vec<String>,
+    pub shared_heavy_keys: Vec<String>,
+    pub recommended_strategy: String,
+    pub right_side_size_mb: Option<u64>,
+    pub broadcast_threshold_mb: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,10 +127,26 @@ pub struct StatsMetadata {
     pub input: InputStats,
     pub heavy_hitter_detection: HeavyHitterDetectionMetadata,
     pub storage: StorageMetadata,
+    pub join: Option<JoinStatisticsMetadata>,
     pub skew: SkewStats,
     pub estimates: PartitionEstimates,
     pub resources: ResourceEstimate,
     pub timing: Option<TimingMetadata>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JoinStatisticsMetadata {
+    pub join_keys: Vec<String>,
+    pub left: JoinSideStatistics,
+    pub right: Option<JoinSideStatistics>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JoinSideStatistics {
+    pub total_rows: u64,
+    pub total_size_bytes: Option<u64>,
+    pub estimated_size_mb: Option<u64>,
+    pub heavy_keys: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -305,6 +332,7 @@ mod tests {
                 join_keys: Vec::new(),
                 notes: Vec::new(),
             },
+            join_plan: None,
             cost_estimate: CostEstimate {
                 estimated_rows_read: 10,
                 estimated_rows_written: 10,
@@ -370,6 +398,7 @@ mod tests {
                 target_file_size_bytes: 134_217_728,
                 min_file_size_bytes: 16_777_216,
             },
+            join: None,
             skew: SkewStats {
                 max_partition_size: 5,
                 mean_partition_size: 5.0,
