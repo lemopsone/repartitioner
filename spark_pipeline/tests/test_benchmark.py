@@ -3,7 +3,9 @@ from __future__ import annotations
 import unittest
 
 from spark_pipeline.benchmark import (
+    comparable_join_checksum_column_names,
     heavy_key_literals_for_join,
+    logical_result_columns,
     method_aware_join_skip_reason,
     resolve_method_aware_partial_group_keys,
     resolve_method_aware_partition_column,
@@ -241,6 +243,31 @@ class MethodAwareJoinTests(unittest.TestCase):
         )
 
         self.assertEqual(reason, "missing_technical_columns")
+
+
+class CorrectnessHelperTests(unittest.TestCase):
+    def test_logical_result_columns_drop_technical_columns(self) -> None:
+        columns = logical_result_columns(
+            [
+                "user_id",
+                "_rp_salt",
+                "_rp_partition_id",
+                "payload",
+                "rp_partition",
+                "join_payload",
+            ]
+        )
+
+        self.assertEqual(columns, ["user_id", "payload", "join_payload"])
+
+    def test_join_checksum_columns_use_logical_intersection(self) -> None:
+        columns = comparable_join_checksum_column_names(
+            ["user_id", "payload", "join_payload"],
+            ["user_id", "payload", "join_payload", "_rp_salt", "rp_partition"],
+            "user_id",
+        )
+
+        self.assertEqual(columns, ["user_id", "join_payload", "payload"])
 
 
 if __name__ == "__main__":

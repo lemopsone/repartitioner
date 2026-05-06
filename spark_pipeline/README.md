@@ -52,8 +52,12 @@ degraded через `extra.salt_column_used = false`,
 `rp_partition` и `ap_partition`, если Spark видит их при чтении dataset.
 
 В JSON/CSV отчётах поле `mode` разделяет `baseline`, `physical_only` и
-`method_aware`, а `correctness` показывает совпадение числа строк и числа групп
-с baseline.
+`method_aware`. Для groupBy `correctness` сохраняет старые проверки размеров,
+а также содержит строгую сверку counts по каждому ключу:
+`exact_group_counts_match`, `group_count_diff_rows` и checksum по `(key,
+count)`. Для join `correctness` сохраняет проверки размеров и добавляет
+`checksum_matches_baseline` по стабильному набору логических колонок результата.
+Технические `_rp_*`/Hive partition columns не участвуют в join checksum.
 
 Для join-aware режимов heavy keys берутся из структурированных metadata полей
 `join_plan.left_heavy_key_values`, `right_heavy_key_values` и

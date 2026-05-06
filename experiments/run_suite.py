@@ -51,6 +51,8 @@ SUMMARY_COLUMNS = [
     "target_partition_size_satisfied",
     "method_aware_row_count_matches_baseline",
     "method_aware_result_rows_match_baseline",
+    "method_aware_exact_group_counts_match",
+    "method_aware_checksum_matches_baseline",
 ]
 
 
@@ -358,6 +360,8 @@ def build_summary_row(
         "target_partition_size_satisfied": feasibility.get("target_partition_size_satisfied"),
         "method_aware_row_count_matches_baseline": correctness(method_aware, "row_count_matches_baseline"),
         "method_aware_result_rows_match_baseline": correctness(method_aware, "result_rows_match_baseline"),
+        "method_aware_exact_group_counts_match": correctness(method_aware, "exact_group_counts_match"),
+        "method_aware_checksum_matches_baseline": correctness(method_aware, "checksum_matches_baseline"),
     }
 
 

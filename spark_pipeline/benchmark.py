@@ -155,7 +155,6 @@ def run_group_by_benchmark(
         dataset_path=original_path,
         key_column=key_column,
     )
-    baseline.correctness = correctness_against_baseline(baseline, baseline)
 
     if warmup:
         preprocessed.select(key_column).limit(1).count()
@@ -167,9 +166,24 @@ def run_group_by_benchmark(
         dataset_path=preprocessed_path,
         key_column=key_column,
     )
-    physical_only.correctness = correctness_against_baseline(physical_only, baseline)
 
     results = [baseline, physical_only]
+    baseline_grouped = group_by_result(original, key_column).cache()
+    physical_grouped = group_by_result(preprocessed, key_column).cache()
+    baseline.correctness = group_by_correctness_against_baseline(
+        baseline,
+        baseline,
+        baseline_grouped,
+        baseline_grouped,
+        key_column,
+    )
+    physical_only.correctness = group_by_correctness_against_baseline(
+        physical_only,
+        baseline,
+        baseline_grouped,
+        physical_grouped,
+        key_column,
+    )
     if include_method_aware:
         partition_column = resolve_method_aware_partition_column(preprocessed, partition_plan)
         salt_column = resolve_method_aware_salt_column(preprocessed, partition_plan)
@@ -194,7 +208,18 @@ def run_group_by_benchmark(
             partial_group_keys=partial_group_keys,
             method_aware_extra=method_aware_extra,
         )
-        method_aware.correctness = correctness_against_baseline(method_aware, baseline)
+        method_aware_grouped = method_aware_group_by_result(
+            preprocessed,
+            key_column=key_column,
+            partial_group_keys=partial_group_keys,
+        )
+        method_aware.correctness = group_by_correctness_against_baseline(
+            method_aware,
+            baseline,
+            baseline_grouped,
+            method_aware_grouped,
+            key_column,
+        )
         results.append(method_aware)
 
     return results
@@ -225,7 +250,6 @@ def run_join_benchmark(
         dataset_path=original_path,
         key_column=key_column,
     )
-    baseline.correctness = correctness_against_baseline(baseline, baseline)
 
     if warmup:
         preprocessed.select(key_column).limit(1).count()
@@ -238,9 +262,24 @@ def run_join_benchmark(
         dataset_path=preprocessed_path,
         key_column=key_column,
     )
-    physical_only.correctness = correctness_against_baseline(physical_only, baseline)
 
     results = [baseline, physical_only]
+    baseline_joined = join_result(original, right, key_column).cache()
+    physical_joined = join_result(preprocessed, right, key_column).cache()
+    baseline.correctness = join_correctness_against_baseline(
+        baseline,
+        baseline,
+        baseline_joined,
+        baseline_joined,
+        key_column,
+    )
+    physical_only.correctness = join_correctness_against_baseline(
+        physical_only,
+        baseline,
+        baseline_joined,
+        physical_joined,
+        key_column,
+    )
     if include_method_aware:
         skip_reason = method_aware_join_skip_reason(
             preprocessed,
@@ -272,7 +311,20 @@ def run_join_benchmark(
                 key_column=key_column,
                 dataset_path=preprocessed_path,
             )
-            method_aware.correctness = correctness_against_baseline(method_aware, baseline)
+            method_aware_joined = method_aware_join_result(
+                spark,
+                preprocessed,
+                right,
+                partition_plan=partition_plan or {},
+                key_column=key_column,
+            )
+            method_aware.correctness = join_correctness_against_baseline(
+                method_aware,
+                baseline,
+                baseline_joined,
+                method_aware_joined,
+                key_column,
+            )
             results.append(method_aware)
 
     return results
@@ -288,7 +340,7 @@ def run_group_by(
     key_column: str,
 ) -> BenchmarkResult:
     def action() -> dict:
-        grouped = dataframe.groupBy(key_column).count()
+        grouped = group_by_result(dataframe, key_column)
         row = grouped.agg(
             F.count(F.lit(1)).alias("result_rows"),
             F.sum("count").alias("rows"),
@@ -316,6 +368,10 @@ def run_group_by(
     )
 
 
+def group_by_result(dataframe: DataFrame, key_column: str) -> DataFrame:
+    return dataframe.groupBy(key_column).count()
+
+
 def run_method_aware_group_by(
     spark: SparkSession,
     dataframe: DataFrame,
@@ -336,8 +392,11 @@ def run_method_aware_group_by(
     )
 
     def action() -> dict:
-        partial = dataframe.groupBy(*group_keys).count()
-        final = partial.groupBy(key_column).agg(F.sum("count").alias("count"))
+        final = method_aware_group_by_result(
+            dataframe,
+            key_column=key_column,
+            partial_group_keys=group_keys,
+        )
         row = final.agg(
             F.count(F.lit(1)).alias("result_rows"),
             F.sum("count").alias("rows"),
@@ -371,6 +430,16 @@ def run_method_aware_group_by(
     )
 
 
+def method_aware_group_by_result(
+    dataframe: DataFrame,
+    *,
+    key_column: str,
+    partial_group_keys: list[str],
+) -> DataFrame:
+    partial = dataframe.groupBy(*partial_group_keys).count()
+    return partial.groupBy(key_column).agg(F.sum("count").alias("count"))
+
+
 def run_join(
     spark: SparkSession,
     left: DataFrame,
@@ -382,15 +451,7 @@ def run_join(
     key_column: str,
 ) -> BenchmarkResult:
     def action() -> dict:
-        joined = left.join(right, on=key_column, how="inner")
-        row = joined.agg(
-            F.count(F.lit(1)).alias("rows"),
-            F.countDistinct(key_column).alias("result_rows"),
-        ).collect()[0]
-        return {
-            "rows": int(row["rows"] or 0),
-            "result_rows": int(row["result_rows"] or 0),
-        }
+        return collect_join_metrics(join_result(left, right, key_column), key_column)
 
     elapsed, metrics = timed(action)
     return BenchmarkResult(
@@ -406,6 +467,14 @@ def run_join(
         correctness={},
         extra={"right_partitions": right.rdd.getNumPartitions()},
     )
+
+
+def join_result(left: DataFrame, right: DataFrame, key_column: str) -> DataFrame:
+    return left.join(right, on=key_column, how="inner")
+
+
+def broadcast_join_result(left: DataFrame, right: DataFrame, key_column: str) -> DataFrame:
+    return left.join(F.broadcast(right), on=key_column, how="inner")
 
 
 def run_method_aware_join(
@@ -426,7 +495,7 @@ def run_method_aware_join(
 
     if strategy == "broadcast_join":
         def action() -> dict:
-            joined = left.join(F.broadcast(right), on=key_column, how="inner")
+            joined = broadcast_join_result(left, right, key_column)
             metrics = collect_join_metrics(joined, key_column)
             metrics["right_replication_rows"] = 0
             return metrics
@@ -439,7 +508,7 @@ def run_method_aware_join(
         }
     elif strategy == "physical_repartitioning":
         def action() -> dict:
-            joined = left.join(right, on=key_column, how="inner")
+            joined = join_result(left, right, key_column)
             metrics = collect_join_metrics(joined, key_column)
             metrics["right_replication_rows"] = 0
             return metrics
@@ -449,67 +518,35 @@ def run_method_aware_join(
             "method_aware_operator_rewrite": False,
         }
     elif strategy in {"salted_heavy_key_join", "heavy_key_isolation_join"}:
-        heavy_side = "shared" if strategy == "salted_heavy_key_join" else "union"
-        heavy_key_literals = heavy_key_literals_for_join(
-            partition_plan,
-            strategy=strategy,
-            key_column=key_column,
-        )
-        heavy_condition = heavy_key_filter_condition(key_column, heavy_key_literals)
-        salt_mapping = build_salt_mapping_dataframe(
-            spark,
-            partition_plan,
-            key_column=key_column,
-            salt_column=salt_column,
-            key_data_type=right.schema[key_column].dataType,
-            heavy_key_literals=heavy_key_literals,
-        )
-
         def action() -> dict:
-            left_heavy = left.where((F.col(heavy_key_column) == F.lit(True)) | heavy_condition)
-            left_normal = left.where(~heavy_condition)
-            right_heavy = right.where(heavy_condition)
-            right_normal = right.join(
-                right_heavy.select(key_column).dropDuplicates([key_column]),
-                key_column,
-                "left_anti",
+            joined, right_heavy_replicated = salted_join_result_with_replication(
+                spark,
+                left,
+                right,
+                partition_plan=partition_plan,
+                key_column=key_column,
             )
-            right_heavy_replicated = right_heavy.join(salt_mapping, on=key_column, how="inner")
-            left_heavy_salted = left_heavy.where(F.col(salt_column).isNotNull())
-            left_heavy_unsalted = left_heavy.where(F.col(salt_column).isNull())
-            heavy_joined_salted = left_heavy_salted.join(
-                right_heavy_replicated,
-                on=[key_column, salt_column],
-                how="inner",
-            )
-            heavy_joined_unsalted = left_heavy_unsalted.join(
-                right_heavy,
-                on=key_column,
-                how="inner",
-            )
-            normal_joined = left_normal.join(right_normal, on=key_column, how="inner")
-            result = normal_joined.unionByName(
-                heavy_joined_salted,
-                allowMissingColumns=True,
-            ).unionByName(
-                heavy_joined_unsalted,
-                allowMissingColumns=True,
-            )
-            metrics = collect_join_metrics(result, key_column)
+            metrics = collect_join_metrics(joined, key_column)
             metrics["right_replication_rows"] = right_heavy_replicated.count()
             return metrics
 
         extra = {
             "strategy": strategy,
-            "heavy_key_count": len(heavy_key_literals),
-            "heavy_key_side": heavy_side,
+            "heavy_key_count": len(
+                heavy_key_literals_for_join(
+                    partition_plan,
+                    strategy=strategy,
+                    key_column=key_column,
+                )
+            ),
+            "heavy_key_side": "shared" if strategy == "salted_heavy_key_join" else "union",
             "salt_column": salt_column,
             "heavy_key_column": heavy_key_column,
             "method_aware_operator_rewrite": True,
         }
     else:
         def action() -> dict:
-            joined = left.join(right, on=key_column, how="inner")
+            joined = join_result(left, right, key_column)
             metrics = collect_join_metrics(joined, key_column)
             metrics["right_replication_rows"] = 0
             return metrics
@@ -538,6 +575,89 @@ def run_method_aware_join(
             "right_replication_rows": metrics["right_replication_rows"],
         },
     )
+
+
+def method_aware_join_result(
+    spark: SparkSession,
+    left: DataFrame,
+    right: DataFrame,
+    *,
+    partition_plan: dict,
+    key_column: str,
+) -> DataFrame:
+    strategy = (partition_plan.get("recommended_downstream_plan") or {}).get("strategy")
+    if strategy == "broadcast_join":
+        return broadcast_join_result(left, right, key_column)
+    if strategy == "physical_repartitioning":
+        return join_result(left, right, key_column)
+    if strategy in {"salted_heavy_key_join", "heavy_key_isolation_join"}:
+        joined, _ = salted_join_result_with_replication(
+            spark,
+            left,
+            right,
+            partition_plan=partition_plan,
+            key_column=key_column,
+        )
+        return joined
+    return join_result(left, right, key_column)
+
+
+def salted_join_result_with_replication(
+    spark: SparkSession,
+    left: DataFrame,
+    right: DataFrame,
+    *,
+    partition_plan: dict,
+    key_column: str,
+) -> tuple[DataFrame, DataFrame]:
+    strategy = (partition_plan.get("recommended_downstream_plan") or {}).get("strategy")
+    technical = partition_plan.get("technical_columns") or {}
+    salt_column = technical.get("salt_column")
+    heavy_key_column = technical.get("heavy_key_column")
+    heavy_key_literals = heavy_key_literals_for_join(
+        partition_plan,
+        strategy=strategy,
+        key_column=key_column,
+    )
+    heavy_condition = heavy_key_filter_condition(key_column, heavy_key_literals)
+    salt_mapping = build_salt_mapping_dataframe(
+        spark,
+        partition_plan,
+        key_column=key_column,
+        salt_column=salt_column,
+        key_data_type=right.schema[key_column].dataType,
+        heavy_key_literals=heavy_key_literals,
+    )
+    left_heavy = left.where((F.col(heavy_key_column) == F.lit(True)) | heavy_condition)
+    left_normal = left.where(~heavy_condition)
+    right_heavy = right.where(heavy_condition)
+    right_normal = right.join(
+        right_heavy.select(key_column).dropDuplicates([key_column]),
+        key_column,
+        "left_anti",
+    )
+    right_heavy_replicated = right_heavy.join(salt_mapping, on=key_column, how="inner")
+    left_heavy_salted = left_heavy.where(F.col(salt_column).isNotNull())
+    left_heavy_unsalted = left_heavy.where(F.col(salt_column).isNull())
+    heavy_joined_salted = left_heavy_salted.join(
+        right_heavy_replicated,
+        on=[key_column, salt_column],
+        how="inner",
+    )
+    heavy_joined_unsalted = left_heavy_unsalted.join(
+        right_heavy,
+        on=key_column,
+        how="inner",
+    )
+    normal_joined = left_normal.join(right_normal, on=key_column, how="inner")
+    result = normal_joined.unionByName(
+        heavy_joined_salted,
+        allowMissingColumns=True,
+    ).unionByName(
+        heavy_joined_unsalted,
+        allowMissingColumns=True,
+    )
+    return result, right_heavy_replicated
 
 
 def collect_join_metrics(joined: DataFrame, key_column: str) -> dict:
@@ -603,6 +723,147 @@ def correctness_against_baseline(result: BenchmarkResult, baseline: BenchmarkRes
     return {
         "row_count_matches_baseline": result.rows == baseline.rows,
         "result_rows_match_baseline": result.result_rows == baseline.result_rows,
+    }
+
+
+def group_by_correctness_against_baseline(
+    result: BenchmarkResult,
+    baseline: BenchmarkResult,
+    baseline_grouped: DataFrame,
+    candidate_grouped: DataFrame,
+    key_column: str,
+) -> dict:
+    correctness = correctness_against_baseline(result, baseline)
+    correctness.update(
+        compare_group_by_results(
+            baseline_grouped,
+            candidate_grouped,
+            key_column,
+        )
+    )
+    correctness.update(
+        checksum_comparison(
+            baseline_grouped,
+            candidate_grouped,
+            checksum_columns=[key_column, "count"],
+        )
+    )
+    return correctness
+
+
+def compare_group_by_results(
+    baseline: DataFrame,
+    candidate: DataFrame,
+    key_column: str,
+) -> dict:
+    baseline_counts = baseline.select(
+        F.col(key_column).alias("baseline_key"),
+        F.col("count").alias("baseline_count"),
+    )
+    candidate_counts = candidate.select(
+        F.col(key_column).alias("candidate_key"),
+        F.col("count").alias("candidate_count"),
+    )
+    diff = baseline_counts.join(
+        candidate_counts,
+        F.col("baseline_key").eqNullSafe(F.col("candidate_key")),
+        "full_outer",
+    ).where(
+        F.coalesce(F.col("baseline_count"), F.lit(-1))
+        != F.coalesce(F.col("candidate_count"), F.lit(-1))
+    )
+    diff_count = diff.count()
+    return {
+        "exact_group_counts_match": diff_count == 0,
+        "group_count_diff_rows": diff_count,
+    }
+
+
+def join_correctness_against_baseline(
+    result: BenchmarkResult,
+    baseline: BenchmarkResult,
+    baseline_joined: DataFrame,
+    candidate_joined: DataFrame,
+    key_column: str,
+) -> dict:
+    correctness = correctness_against_baseline(result, baseline)
+    checksum_columns = comparable_join_checksum_columns(
+        baseline_joined,
+        candidate_joined,
+        key_column,
+    )
+    correctness.update(
+        checksum_comparison(
+            baseline_joined,
+            candidate_joined,
+            checksum_columns=checksum_columns,
+        )
+    )
+    correctness["checksum_columns"] = checksum_columns
+    return correctness
+
+
+def checksum_comparison(
+    baseline: DataFrame,
+    candidate: DataFrame,
+    *,
+    checksum_columns: list[str],
+) -> dict:
+    baseline_checksum = dataframe_checksum(baseline, checksum_columns)
+    candidate_checksum = dataframe_checksum(candidate, checksum_columns)
+    return {
+        "checksum_matches_baseline": baseline_checksum == candidate_checksum,
+        "baseline_checksum": baseline_checksum,
+        "candidate_checksum": candidate_checksum,
+    }
+
+
+def dataframe_checksum(dataframe: DataFrame, columns: list[str]) -> int:
+    selected_columns = [F.col(column).cast("string") for column in columns]
+    row = dataframe.select(F.xxhash64(*selected_columns).alias("h")).agg(
+        F.sum("h").alias("checksum")
+    ).collect()[0]
+    return int(row["checksum"] or 0)
+
+
+def comparable_join_checksum_columns(
+    baseline: DataFrame,
+    candidate: DataFrame,
+    key_column: str,
+) -> list[str]:
+    return comparable_join_checksum_column_names(
+        baseline.columns,
+        candidate.columns,
+        key_column,
+    )
+
+
+def comparable_join_checksum_column_names(
+    baseline_columns: Iterable[str],
+    candidate_columns: Iterable[str],
+    key_column: str,
+) -> list[str]:
+    baseline_columns = set(logical_result_columns(baseline_columns))
+    candidate_columns = set(logical_result_columns(candidate_columns))
+    columns = sorted(baseline_columns & candidate_columns)
+    if key_column in columns:
+        columns.remove(key_column)
+        columns.insert(0, key_column)
+    return columns or [key_column]
+
+
+def logical_result_columns(columns: Iterable[str]) -> list[str]:
+    return [
+        column
+        for column in unique_preserving_order(columns)
+        if not is_technical_result_column(column)
+    ]
+
+
+def is_technical_result_column(column: str) -> bool:
+    return column.startswith("_rp_") or column.startswith("_ap_") or column in {
+        "rp_partition",
+        "ap_partition",
     }
 
 
