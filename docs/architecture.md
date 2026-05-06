@@ -64,6 +64,30 @@ Additional formats such as CSV, ORC, or Avro should be added as new adapters
 implementing the same traits, without changing the statistics/planner/
 partitioner logic.
 
+## Approximate heavy hitter mode
+
+`statistics.heavy_hitter_mode: "exact"` is the default and materializes the full
+key frequency map. In this mode `_stats.json` reports exact `distinct_keys`,
+exact `key_frequencies`, and allows the planner to build a complete
+load-aware normal-key assignment.
+
+`statistics.heavy_hitter_mode: "approximate"` uses a bounded Space-Saving
+summary for heavy-key detection. The summary is not a complete key
+distribution, so metadata marks it explicitly:
+
+- `heavy_hitter_detection.exact = false`;
+- `heavy_hitter_detection.frequencies_truncated = true`;
+- `input.key_frequencies_exact = false`;
+- `input.key_frequencies_truncated = true`;
+- `input.normal_keys_materialized = false`;
+- `input.distinct_keys = null`.
+
+In approximate mode the planner supports heavy-key salting, but it does not
+build a full `normal_keys` plan from the top-K summary. If
+`normal_key_assignment: "load_aware"` is configured, the effective normal-key
+assignment falls back to hash placement and the plan records the note
+`load_aware_normal_assignment_disabled_in_approximate_mode`.
+
 ## CLI
 
 Example command:
@@ -128,8 +152,8 @@ rewritten, although filter selectivity is currently not estimated and is
 reported as a plan note.
 
 For `group_by`, the plan recommends method-aware two-stage aggregation:
-partial aggregation by `["_rp_partition_id", ...key_columns]`, followed by
-final aggregation by the original key columns.
+partial aggregation by `["_rp_partition_id", "_rp_salt", ...key_columns]`,
+followed by final aggregation by the original key columns.
 
 For `join`, the plan recommends method-aware salted heavy-key join logic using
 the materialized technical columns `_rp_salt` and `_rp_is_heavy_key`.

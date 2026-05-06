@@ -43,6 +43,11 @@ pub fn compute_statistics(config: &Config, dataset: &InputDataset) -> Result<Com
     let resources = resource_estimate(config, dataset)?;
     let file_size_summary = file_size_summary(config, dataset);
     let key_frequency_summary = key_frequency_summary(dataset, config);
+    let key_frequencies_exact = key_frequency_summary.key_frequencies_exact;
+    let key_frequencies_truncated = key_frequency_summary.key_frequencies_truncated;
+    let normal_keys_materialized = key_frequency_summary.normal_keys_materialized;
+    let distinct_keys =
+        key_frequencies_exact.then_some(key_frequency_summary.frequencies.len() as u64);
     let key_frequencies = key_frequency_summary.frequencies;
     let key_values = key_value_map(dataset, &config.partitioning.key_columns);
     let mean_key_frequency = mean_frequency(&key_frequencies);
@@ -95,7 +100,10 @@ pub fn compute_statistics(config: &Config, dataset: &InputDataset) -> Result<Com
             small_file_count: file_size_summary.small_file_count,
             oversized_file_count: file_size_summary.oversized_file_count,
             estimated_row_width_bytes,
-            distinct_keys: Some(key_frequencies.len() as u64),
+            distinct_keys,
+            key_frequencies_exact,
+            key_frequencies_truncated,
+            normal_keys_materialized,
             mean_key_frequency,
             max_key_frequency,
             key_frequencies,
@@ -174,6 +182,9 @@ fn total_input_size_bytes(input_files: &[InputFileStats]) -> Option<u64> {
 struct KeyFrequencySummary {
     frequencies: BTreeMap<String, u64>,
     detection_metadata: HeavyHitterDetectionMetadata,
+    key_frequencies_exact: bool,
+    key_frequencies_truncated: bool,
+    normal_keys_materialized: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -296,15 +307,27 @@ fn estimated_row_width_bytes(dataset: &InputDataset) -> Option<u64> {
 }
 
 fn key_frequency_summary(dataset: &InputDataset, config: &Config) -> KeyFrequencySummary {
+    let observed_total_rows = dataset.rows.row_count();
     match config.statistics.heavy_hitter_mode {
-        HeavyHitterMode::Exact => KeyFrequencySummary {
-            frequencies: key_frequencies(dataset, &config.partitioning.key_columns),
-            detection_metadata: HeavyHitterDetectionMetadata {
-                mode: "exact".to_string(),
-                capacity: config.statistics.approximate_capacity.get(),
-                error_bound: "0".to_string(),
-            },
-        },
+        HeavyHitterMode::Exact => {
+            let frequencies = key_frequencies(dataset, &config.partitioning.key_columns);
+            KeyFrequencySummary {
+                detection_metadata: HeavyHitterDetectionMetadata {
+                    mode: "exact".to_string(),
+                    capacity: config.statistics.approximate_capacity.get(),
+                    error_bound: "0".to_string(),
+                    exact: true,
+                    frequencies_truncated: false,
+                    summary_size: frequencies.len(),
+                    observed_total_rows,
+                    max_error: Some(0),
+                },
+                frequencies,
+                key_frequencies_exact: true,
+                key_frequencies_truncated: false,
+                normal_keys_materialized: true,
+            }
+        }
         HeavyHitterMode::Approximate => {
             let summary = heavy_hitters::space_saving(
                 dataset
@@ -314,13 +337,22 @@ fn key_frequency_summary(dataset: &InputDataset, config: &Config) -> KeyFrequenc
                     .filter_map(|row| row.partition_key(&config.partitioning.key_columns)),
                 config.statistics.approximate_capacity.get(),
             );
+            let summary_size = summary.frequencies.len();
             KeyFrequencySummary {
                 frequencies: summary.frequencies,
                 detection_metadata: HeavyHitterDetectionMetadata {
                     mode: "approximate".to_string(),
                     capacity: config.statistics.approximate_capacity.get(),
                     error_bound: format!("space_saving_max_overestimate={}", summary.max_error),
+                    exact: false,
+                    frequencies_truncated: true,
+                    summary_size,
+                    observed_total_rows,
+                    max_error: Some(summary.max_error),
                 },
+                key_frequencies_exact: false,
+                key_frequencies_truncated: true,
+                normal_keys_materialized: false,
             }
         }
     }
@@ -497,6 +529,41 @@ mod tests {
     }
 
     #[test]
+    fn exact_mode_preserves_current_exact_metadata() {
+        let config = example_config();
+        let dataset = InputDataset::from_rows(Dataset::from_key_values(
+            "user_id",
+            ["a", "a", "b", "c"].into_iter().map(String::from),
+        ));
+
+        let statistics = compute_statistics(&config, &dataset).expect("statistics should compute");
+
+        assert_eq!(statistics.metadata.input.distinct_keys, Some(3));
+        assert!(statistics.metadata.input.key_frequencies_exact);
+        assert!(!statistics.metadata.input.key_frequencies_truncated);
+        assert!(statistics.metadata.input.normal_keys_materialized);
+        assert!(statistics.metadata.heavy_hitter_detection.exact);
+        assert!(
+            !statistics
+                .metadata
+                .heavy_hitter_detection
+                .frequencies_truncated
+        );
+        assert_eq!(statistics.metadata.heavy_hitter_detection.summary_size, 3);
+        assert_eq!(
+            statistics
+                .metadata
+                .heavy_hitter_detection
+                .observed_total_rows,
+            4
+        );
+        assert_eq!(
+            statistics.metadata.heavy_hitter_detection.max_error,
+            Some(0)
+        );
+    }
+
+    #[test]
     fn detects_heavy_key_from_in_memory_rows() {
         let config = example_config();
         let dataset = InputDataset::from_rows(Dataset::from_key_values(
@@ -522,7 +589,90 @@ mod tests {
 
     #[test]
     fn approximate_heavy_hitter_mode_detects_synthetic_heavy_key() {
-        let config = Config::from_yaml_str(
+        let config = approximate_config(32);
+        let dataset = InputDataset::from_rows(Dataset::from_key_values(
+            "user_id",
+            std::iter::repeat_n("heavy".to_string(), 200)
+                .chain((0..800).map(|index| format!("key_{index}"))),
+        ));
+
+        let statistics = compute_statistics(&config, &dataset).expect("statistics should compute");
+
+        assert_eq!(
+            statistics.metadata.heavy_hitter_detection.mode,
+            "approximate"
+        );
+        assert!(!statistics.metadata.heavy_hitter_detection.exact);
+        assert!(
+            statistics
+                .metadata
+                .heavy_hitter_detection
+                .frequencies_truncated
+        );
+        assert_eq!(statistics.metadata.heavy_hitter_detection.capacity, 32);
+        assert_eq!(
+            statistics.metadata.heavy_hitter_detection.summary_size,
+            statistics.metadata.input.key_frequencies.len()
+        );
+        assert_eq!(
+            statistics
+                .metadata
+                .heavy_hitter_detection
+                .observed_total_rows,
+            1000
+        );
+        assert!(statistics
+            .metadata
+            .heavy_hitter_detection
+            .max_error
+            .is_some());
+        assert!(statistics
+            .metadata
+            .heavy_hitter_detection
+            .error_bound
+            .starts_with("space_saving_max_overestimate="));
+        assert!(statistics
+            .metadata
+            .input
+            .heavy_hitters
+            .iter()
+            .any(|heavy| heavy.key == "7:user_id#utf8:5:heavy"));
+        assert!(statistics.metadata.input.key_frequencies.len() <= 32);
+    }
+
+    #[test]
+    fn approximate_mode_marks_key_frequencies_as_truncated() {
+        let config = approximate_config(8);
+        let dataset = InputDataset::from_rows(Dataset::from_key_values(
+            "user_id",
+            std::iter::repeat_n("heavy".to_string(), 50)
+                .chain((0..200).map(|index| format!("key_{index}"))),
+        ));
+
+        let statistics = compute_statistics(&config, &dataset).expect("statistics should compute");
+
+        assert!(!statistics.metadata.input.key_frequencies_exact);
+        assert!(statistics.metadata.input.key_frequencies_truncated);
+        assert!(!statistics.metadata.input.normal_keys_materialized);
+        assert!(statistics.metadata.input.key_frequencies.len() <= 8);
+    }
+
+    #[test]
+    fn approximate_mode_sets_distinct_keys_to_none() {
+        let config = approximate_config(8);
+        let dataset = InputDataset::from_rows(Dataset::from_key_values(
+            "user_id",
+            std::iter::repeat_n("heavy".to_string(), 50)
+                .chain((0..200).map(|index| format!("key_{index}"))),
+        ));
+
+        let statistics = compute_statistics(&config, &dataset).expect("statistics should compute");
+
+        assert_eq!(statistics.metadata.input.distinct_keys, None);
+    }
+
+    fn approximate_config(capacity: usize) -> Config {
+        Config::from_yaml_str(&format!(
             r#"
 dataset:
   input: "./data/input.parquet"
@@ -539,7 +689,7 @@ partitioning:
 
 statistics:
   heavy_hitter_mode: "approximate"
-  approximate_capacity: 32
+  approximate_capacity: {capacity}
 
 job:
   type: "group_by"
@@ -548,34 +698,9 @@ job:
 resources:
   local_threads: 8
   memory_limit_mb: 4096
-"#,
-        )
-        .expect("config should parse");
-        let dataset = InputDataset::from_rows(Dataset::from_key_values(
-            "user_id",
-            std::iter::repeat_n("heavy".to_string(), 200)
-                .chain((0..800).map(|index| format!("key_{index}"))),
-        ));
-
-        let statistics = compute_statistics(&config, &dataset).expect("statistics should compute");
-
-        assert_eq!(
-            statistics.metadata.heavy_hitter_detection.mode,
-            "approximate"
-        );
-        assert_eq!(statistics.metadata.heavy_hitter_detection.capacity, 32);
-        assert!(statistics
-            .metadata
-            .heavy_hitter_detection
-            .error_bound
-            .starts_with("space_saving_max_overestimate="));
-        assert!(statistics
-            .metadata
-            .input
-            .heavy_hitters
-            .iter()
-            .any(|heavy| heavy.key == "7:user_id#utf8:5:heavy"));
-        assert!(statistics.metadata.input.key_frequencies.len() <= 32);
+"#
+        ))
+        .expect("config should parse")
     }
 
     #[test]

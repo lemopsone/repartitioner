@@ -38,20 +38,25 @@ pub fn build_plan(config: &Config, statistics: &ComputedStatistics) -> Result<Pl
         .map(|heavy| heavy.key.as_str())
         .collect();
     let structured_keys = structured_key_map(statistics);
+    let normal_assignment = normal_assignment_planning(config, statistics);
 
     let mut estimated_partition_loads = vec![0_u64; output_partitions];
-    let mut normal_items = statistics
-        .metadata
-        .input
-        .key_frequencies
-        .iter()
-        .filter(|(key, _)| !heavy_key_names.contains(key.as_str()))
-        .collect::<Vec<_>>();
+    let mut normal_items = if normal_assignment.complete {
+        statistics
+            .metadata
+            .input
+            .key_frequencies
+            .iter()
+            .filter(|(key, _)| !heavy_key_names.contains(key.as_str()))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     normal_items.sort_by(|left, right| right.1.cmp(left.1).then_with(|| left.0.cmp(right.0)));
 
     let mut normal_keys = Vec::with_capacity(normal_items.len());
     for (key, frequency) in normal_items {
-        let partition_id = match config.partitioning.normal_key_assignment {
+        let partition_id = match &normal_assignment.strategy {
             NormalKeyAssignment::Hash => {
                 hashing::partition_id(key, output_partitions, config.partitioning.seed)
             }
@@ -112,6 +117,7 @@ pub fn build_plan(config: &Config, statistics: &ComputedStatistics) -> Result<Pl
         target_partition_rows,
         &heavy_keys,
         &planned_partition_loads,
+        normal_assignment.complete,
     );
     let cost_estimate = cost_estimate(
         statistics,
@@ -147,7 +153,9 @@ pub fn build_plan(config: &Config, statistics: &ComputedStatistics) -> Result<Pl
                 salt_column: config.output.salt_column.clone(),
                 heavy_key_column: config.output.heavy_key_column.clone(),
             },
-            normal_key_assignment: config.partitioning.normal_key_assignment.clone(),
+            normal_key_assignment: normal_assignment.strategy,
+            normal_key_assignment_complete: normal_assignment.complete,
+            normal_key_assignment_notes: normal_assignment.notes,
             normal_keys,
             heavy_keys,
             recommended_downstream_plan,
@@ -242,6 +250,37 @@ fn structured_key_map(statistics: &ComputedStatistics) -> BTreeMap<String, PlanK
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct NormalAssignmentPlanning {
+    strategy: NormalKeyAssignment,
+    complete: bool,
+    notes: Vec<String>,
+}
+
+fn normal_assignment_planning(
+    config: &Config,
+    statistics: &ComputedStatistics,
+) -> NormalAssignmentPlanning {
+    if statistics.metadata.input.normal_keys_materialized {
+        return NormalAssignmentPlanning {
+            strategy: config.partitioning.normal_key_assignment.clone(),
+            complete: true,
+            notes: Vec::new(),
+        };
+    }
+
+    let mut notes = vec!["normal_key_frequencies_truncated".to_string()];
+    if config.partitioning.normal_key_assignment == NormalKeyAssignment::LoadAware {
+        notes.push("load_aware_normal_assignment_disabled_in_approximate_mode".to_string());
+    }
+
+    NormalAssignmentPlanning {
+        strategy: NormalKeyAssignment::Hash,
+        complete: false,
+        notes,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct RewriteDecision {
     rewrite_required: bool,
     action: PlanAction,
@@ -255,6 +294,7 @@ fn rewrite_decision(
     target_partition_rows: u64,
     heavy_keys: &[HeavyKeyPlan],
     planned_partition_loads: &[u64],
+    normal_key_assignment_complete: bool,
 ) -> RewriteDecision {
     if config.partitioning.force_rewrite {
         return rewrite("force_rewrite");
@@ -262,6 +302,10 @@ fn rewrite_decision(
 
     if !heavy_keys.is_empty() {
         return rewrite("heavy_keys_detected");
+    }
+
+    if !normal_key_assignment_complete {
+        return no_rewrite("normal_key_assignment_incomplete");
     }
 
     let skew = &statistics.metadata.skew;
@@ -1071,6 +1115,51 @@ mod tests {
     }
 
     #[test]
+    fn approximate_mode_does_not_materialize_full_normal_keys() {
+        let config = config_with_approximate_mode("load_aware", 8);
+        let dataset = InputDataset::from_rows(Dataset::from_key_values(
+            "user_id",
+            (0..250).map(|index| format!("key_{index}")),
+        ));
+        let statistics = compute_statistics(&config, &dataset).expect("statistics should compute");
+        let plan = build_plan(&config, &statistics).expect("plan should build");
+
+        assert!(!statistics.metadata.input.normal_keys_materialized);
+        assert!(plan.metadata.normal_keys.is_empty());
+        assert!(!plan.metadata.normal_key_assignment_complete);
+    }
+
+    #[test]
+    fn approximate_mode_disables_load_aware_normal_assignment_with_warning() {
+        let config = config_with_approximate_mode("load_aware", 8);
+        let dataset = InputDataset::from_rows(Dataset::from_key_values(
+            "user_id",
+            (0..250).map(|index| format!("key_{index}")),
+        ));
+        let statistics = compute_statistics(&config, &dataset).expect("statistics should compute");
+        let plan = build_plan(&config, &statistics).expect("plan should build");
+
+        assert_eq!(
+            plan.metadata.normal_key_assignment,
+            NormalKeyAssignment::Hash
+        );
+        assert!(!plan.metadata.normal_key_assignment_complete);
+        assert!(plan
+            .metadata
+            .normal_key_assignment_notes
+            .contains(&"load_aware_normal_assignment_disabled_in_approximate_mode".to_string()));
+        assert!(plan
+            .metadata
+            .normal_key_assignment_notes
+            .contains(&"normal_key_frequencies_truncated".to_string()));
+        assert_eq!(plan.metadata.action, PlanAction::NoOp);
+        assert_eq!(
+            plan.metadata.skip_reason.as_deref(),
+            Some("normal_key_assignment_incomplete")
+        );
+    }
+
+    #[test]
     fn produces_serializable_partition_plan() {
         let config = example_config();
         let dataset = InputDataset::from_rows(Dataset::from_key_values(
@@ -1447,6 +1536,39 @@ partitioning:
   normal_key_assignment: "{normal_key_assignment}"
   heavy_key_alpha: 2.0
   seed: 42
+
+job:
+  type: "group_by"
+  downstream_engine: "spark"
+
+resources:
+  local_threads: 8
+  memory_limit_mb: 4096
+"#
+        ))
+        .expect("test config should parse")
+    }
+
+    fn config_with_approximate_mode(normal_key_assignment: &str, capacity: usize) -> Config {
+        Config::from_yaml_str(&format!(
+            r#"
+dataset:
+  input: "./data/input.parquet"
+  output: "./data/output_partitioned"
+  format: "parquet"
+
+partitioning:
+  key_columns: ["user_id"]
+  target_partition_size_mb: 128
+  max_partitions: 4
+  strategy: "adaptive_hash_salt"
+  normal_key_assignment: "{normal_key_assignment}"
+  heavy_key_alpha: 2.0
+  seed: 42
+
+statistics:
+  heavy_hitter_mode: "approximate"
+  approximate_capacity: {capacity}
 
 job:
   type: "group_by"

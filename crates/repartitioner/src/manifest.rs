@@ -28,6 +28,8 @@ pub struct PartitionPlan {
     pub feasibility: PartitionPlanFeasibility,
     pub technical_columns: TechnicalColumns,
     pub normal_key_assignment: NormalKeyAssignment,
+    pub normal_key_assignment_complete: bool,
+    pub normal_key_assignment_notes: Vec<String>,
     pub normal_keys: Vec<NormalKeyPlan>,
     pub heavy_keys: Vec<HeavyKeyPlan>,
     pub recommended_downstream_plan: RecommendedDownstreamPlan,
@@ -176,6 +178,11 @@ pub struct HeavyHitterDetectionMetadata {
     pub mode: String,
     pub capacity: usize,
     pub error_bound: String,
+    pub exact: bool,
+    pub frequencies_truncated: bool,
+    pub summary_size: usize,
+    pub observed_total_rows: u64,
+    pub max_error: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -209,6 +216,9 @@ pub struct InputStats {
     pub oversized_file_count: usize,
     pub estimated_row_width_bytes: Option<u64>,
     pub distinct_keys: Option<u64>,
+    pub key_frequencies_exact: bool,
+    pub key_frequencies_truncated: bool,
+    pub normal_keys_materialized: bool,
     pub mean_key_frequency: f64,
     pub max_key_frequency: u64,
     pub key_frequencies: BTreeMap<String, u64>,
@@ -375,6 +385,8 @@ mod tests {
                 heavy_key_column: "_rp_is_heavy_key".to_string(),
             },
             normal_key_assignment: NormalKeyAssignment::LoadAware,
+            normal_key_assignment_complete: true,
+            normal_key_assignment_notes: Vec::new(),
             normal_keys: vec![NormalKeyPlan {
                 key: "user_id=7".to_string(),
                 estimated_frequency: 10,
@@ -447,6 +459,7 @@ mod tests {
         assert_eq!(value["hash_function"].as_str(), Some("fnv1a64_seeded"));
         assert!(value["cost_estimate"].is_object());
         assert!(json.contains("\"strategy\":\"adaptive_hash_salt\""));
+        assert!(json.contains("\"normal_key_assignment_complete\":true"));
         assert!(json.contains("\"normal_keys\""));
         assert!(json.contains("\"salt_count\":3"));
         assert!(json.contains("\"salt_partitions\""));
@@ -473,6 +486,9 @@ mod tests {
                 oversized_file_count: 0,
                 estimated_row_width_bytes: Some(128),
                 distinct_keys: Some(2),
+                key_frequencies_exact: true,
+                key_frequencies_truncated: false,
+                normal_keys_materialized: true,
                 mean_key_frequency: 5.0,
                 max_key_frequency: 5,
                 key_frequencies: BTreeMap::from([("a".to_string(), 5), ("b".to_string(), 5)]),
@@ -483,6 +499,11 @@ mod tests {
                 mode: "exact".to_string(),
                 capacity: 10_000,
                 error_bound: "0".to_string(),
+                exact: true,
+                frequencies_truncated: false,
+                summary_size: 2,
+                observed_total_rows: 10,
+                max_error: Some(0),
             },
             storage: StorageMetadata {
                 target_file_size_mb: 128,
@@ -582,7 +603,19 @@ mod tests {
             stats_value["heavy_hitter_detection"]["mode"].as_str(),
             Some("exact")
         );
+        assert_eq!(
+            stats_value["heavy_hitter_detection"]["exact"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            stats_value["heavy_hitter_detection"]["summary_size"].as_u64(),
+            Some(2)
+        );
         assert_eq!(stats_value["input"]["input_file_count"].as_u64(), Some(1));
+        assert_eq!(
+            stats_value["input"]["key_frequencies_exact"].as_bool(),
+            Some(true)
+        );
         assert_eq!(stats_value["input"]["small_file_count"].as_u64(), Some(1));
         assert!(stats_value["storage"].is_object());
         assert!(stats_value["skew"].is_object());

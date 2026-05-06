@@ -42,6 +42,21 @@ The tool should collect:
 - variance and coefficient of variation;
 - max/mean imbalance ratio.
 
+Exact statistics are the default. In exact mode `key_frequencies` and
+`distinct_keys` describe the full observed key distribution.
+
+Approximate heavy hitter mode is a bounded summary mode. It may be used to
+detect heavy keys without storing the full key frequency map, but its
+`key_frequencies` field is only a truncated summary. Therefore:
+
+- `distinct_keys` is unknown and must be serialized as `null`;
+- `key_frequencies_exact` is `false`;
+- `key_frequencies_truncated` is `true`;
+- `normal_keys_materialized` is `false`.
+
+The approximate summary must not be interpreted as the complete distribution of
+normal keys.
+
 ## Heavy hitter detection
 
 A key is considered heavy if its estimated frequency is significantly higher than the average frequency.
@@ -64,7 +79,7 @@ The planner should:
 
 1. Estimate the distribution of keys.
 2. Detect heavy keys.
-3. Assign normal keys by hash partitioning.
+3. Assign normal keys by hash or complete load-aware placement.
 4. Split heavy keys across several buckets.
 5. Compute an output partition id for each record.
 6. Try to keep partition sizes below L.
@@ -81,6 +96,11 @@ Adaptive hash partitioning with selective salting:
 The number of salt buckets for a heavy key should be proportional to its frequency:
 
 salt_count(key) = ceil(freq(key) / target_partition_rows)
+
+If only an approximate heavy-key summary is available, load-aware placement of
+normal keys is disabled because the planner does not know the full set of
+normal keys. Normal rows then use hash fallback unless they belong to a planned
+heavy key.
 
 ## Metadata
 
