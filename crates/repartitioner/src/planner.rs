@@ -97,6 +97,8 @@ pub fn build_plan(config: &Config, statistics: &ComputedStatistics) -> Result<Pl
         rewrite_decision.rewrite_required,
         rewrite_decision.cost_reason.clone(),
     );
+    let join_plan = join_plan(config, statistics);
+    let recommended_downstream_plan = recommended_downstream_plan(config, join_plan.as_ref());
 
     Ok(Plan {
         metadata: PartitionPlan {
@@ -126,8 +128,8 @@ pub fn build_plan(config: &Config, statistics: &ComputedStatistics) -> Result<Pl
             },
             normal_keys,
             heavy_keys,
-            recommended_downstream_plan: recommended_downstream_plan(config),
-            join_plan: join_plan(config, statistics),
+            recommended_downstream_plan,
+            join_plan,
             cost_estimate,
             skip_reason: rewrite_decision.skip_reason,
             hash_function: hashing::HASH_FUNCTION_NAME.to_string(),
@@ -258,7 +260,10 @@ fn cost_estimate(
     }
 }
 
-fn recommended_downstream_plan(config: &Config) -> RecommendedDownstreamPlan {
+fn recommended_downstream_plan(
+    config: &Config,
+    join_plan: Option<&JoinPlan>,
+) -> RecommendedDownstreamPlan {
     let partition_column = technical_column_name(
         config.output.include_technical_columns,
         &config.output.partition_column,
@@ -299,13 +304,7 @@ fn recommended_downstream_plan(config: &Config) -> RecommendedDownstreamPlan {
                 config.partitioning.key_columns.clone(),
                 Vec::new(),
             ),
-            JobType::Join => (
-                "salted_heavy_key_join",
-                true,
-                Vec::new(),
-                Vec::new(),
-                config.partitioning.key_columns.clone(),
-            ),
+            JobType::Join => join_recommendation(config, join_plan, &mut notes),
             JobType::Generic => (
                 "physical_repartitioning",
                 false,
@@ -327,6 +326,64 @@ fn recommended_downstream_plan(config: &Config) -> RecommendedDownstreamPlan {
         join_keys,
         notes,
     }
+}
+
+fn join_recommendation(
+    config: &Config,
+    join_plan: Option<&JoinPlan>,
+    notes: &mut Vec<String>,
+) -> (&'static str, bool, Vec<String>, Vec<String>, Vec<String>) {
+    let join_keys = config
+        .join
+        .as_ref()
+        .map(|join| join.join_keys.clone())
+        .unwrap_or_else(|| config.partitioning.key_columns.clone());
+
+    let Some(join_plan) = join_plan else {
+        notes.push("join_plan_missing".to_string());
+        return (
+            "generic_join_repartitioning",
+            true,
+            Vec::new(),
+            Vec::new(),
+            join_keys,
+        );
+    };
+
+    let (strategy, requires_operator_rewrite, note) = match join_plan.recommended_strategy.as_str()
+    {
+        "broadcast_join_recommendation" => ("broadcast_join", true, "right_side_broadcastable"),
+        "salted_heavy_key_join" => ("salted_heavy_key_join", true, "shared_heavy_keys_detected"),
+        "heavy_key_isolation_join" => (
+            "heavy_key_isolation_join",
+            true,
+            "one_sided_heavy_keys_detected",
+        ),
+        "physical_only" => (
+            "physical_repartitioning",
+            false,
+            "no_join_heavy_keys_detected",
+        ),
+        _ => {
+            notes.push("join_plan_missing".to_string());
+            return (
+                "generic_join_repartitioning",
+                true,
+                Vec::new(),
+                Vec::new(),
+                join_keys,
+            );
+        }
+    };
+    notes.push(note.to_string());
+
+    (
+        strategy,
+        requires_operator_rewrite,
+        Vec::new(),
+        Vec::new(),
+        join_keys,
+    )
 }
 
 fn technical_column_name(included: bool, column: &str) -> Option<String> {
@@ -748,15 +805,19 @@ mod tests {
     }
 
     #[test]
-    fn join_plan_recommends_salted_heavy_key_join() {
+    fn join_recommendation_records_missing_join_plan_note() {
         let config = config_with_job_type("join");
         let plan = build_plan_for_job_config(&config);
 
         let recommendation = &plan.metadata.recommended_downstream_plan;
         assert_eq!(plan.metadata.job_type, crate::config::JobType::Join);
-        assert_eq!(recommendation.strategy, "salted_heavy_key_join");
+        assert!(plan.metadata.join_plan.is_none());
+        assert_eq!(recommendation.strategy, "generic_join_repartitioning");
         assert!(recommendation.requires_operator_rewrite);
         assert_eq!(recommendation.join_keys, vec!["user_id".to_string()]);
+        assert!(recommendation
+            .notes
+            .contains(&"join_plan_missing".to_string()));
         assert_eq!(recommendation.salt_column.as_deref(), Some("_rp_salt"));
         assert_eq!(
             recommendation.heavy_key_column.as_deref(),
@@ -765,7 +826,7 @@ mod tests {
     }
 
     #[test]
-    fn join_plan_recommends_broadcast_for_small_right_side() {
+    fn join_recommendation_uses_broadcast_strategy_for_small_right_side() {
         let config = config_with_join(10);
         let left_dataset =
             InputDataset::from_rows(Dataset::from_key_values("user_id", ["a", "b", "c", "d"]));
@@ -775,21 +836,24 @@ mod tests {
         );
 
         let plan = build_join_plan(&config, left_dataset, right_dataset);
-        let join_plan = plan
-            .metadata
-            .join_plan
-            .expect("join plan should be present");
+        let join_plan = plan.metadata.join_plan.as_ref().unwrap();
+        let recommendation = &plan.metadata.recommended_downstream_plan;
 
         assert_eq!(
             join_plan.recommended_strategy,
             "broadcast_join_recommendation"
         );
+        assert_eq!(recommendation.strategy, "broadcast_join");
+        assert!(recommendation.requires_operator_rewrite);
+        assert!(recommendation
+            .notes
+            .contains(&"right_side_broadcastable".to_string()));
         assert_eq!(join_plan.right_side_size_mb, Some(2));
         assert_eq!(join_plan.broadcast_threshold_mb, Some(10));
     }
 
     #[test]
-    fn join_plan_uses_shared_heavy_keys_from_both_sides() {
+    fn join_recommendation_uses_salted_strategy_for_shared_heavy_keys() {
         let config = config_with_join(0);
         let left_dataset = InputDataset::from_rows(Dataset::from_key_values(
             "user_id",
@@ -804,12 +868,15 @@ mod tests {
         );
 
         let plan = build_join_plan(&config, left_dataset, right_dataset);
-        let join_plan = plan
-            .metadata
-            .join_plan
-            .expect("join plan should be present");
+        let join_plan = plan.metadata.join_plan.as_ref().unwrap();
+        let recommendation = &plan.metadata.recommended_downstream_plan;
 
         assert_eq!(join_plan.recommended_strategy, "salted_heavy_key_join");
+        assert_eq!(recommendation.strategy, "salted_heavy_key_join");
+        assert!(recommendation.requires_operator_rewrite);
+        assert!(recommendation
+            .notes
+            .contains(&"shared_heavy_keys_detected".to_string()));
         assert_eq!(
             join_plan.shared_heavy_keys,
             vec!["7:user_id#utf8:5:heavy".to_string()]
@@ -819,7 +886,7 @@ mod tests {
     }
 
     #[test]
-    fn join_plan_recommends_heavy_key_isolation_for_one_sided_heavy_key() {
+    fn join_recommendation_uses_heavy_key_isolation_for_one_sided_heavy_keys() {
         let config = config_with_join(0);
         let left_dataset = InputDataset::from_rows(Dataset::from_key_values(
             "user_id",
@@ -831,19 +898,22 @@ mod tests {
         );
 
         let plan = build_join_plan(&config, left_dataset, right_dataset);
-        let join_plan = plan
-            .metadata
-            .join_plan
-            .expect("join plan should be present");
+        let join_plan = plan.metadata.join_plan.as_ref().unwrap();
+        let recommendation = &plan.metadata.recommended_downstream_plan;
 
         assert_eq!(join_plan.recommended_strategy, "heavy_key_isolation_join");
+        assert_eq!(recommendation.strategy, "heavy_key_isolation_join");
+        assert!(recommendation.requires_operator_rewrite);
+        assert!(recommendation
+            .notes
+            .contains(&"one_sided_heavy_keys_detected".to_string()));
         assert!(join_plan.shared_heavy_keys.is_empty());
         assert_eq!(join_plan.left_heavy_keys.len(), 1);
         assert!(join_plan.right_heavy_keys.is_empty());
     }
 
     #[test]
-    fn join_plan_recommends_physical_only_without_broadcast_or_heavy_keys() {
+    fn join_recommendation_uses_physical_only_without_heavy_keys() {
         let config = config_with_join(0);
         let left_dataset = InputDataset::from_rows(Dataset::from_key_values(
             "user_id",
@@ -855,12 +925,15 @@ mod tests {
         );
 
         let plan = build_join_plan(&config, left_dataset, right_dataset);
-        let join_plan = plan
-            .metadata
-            .join_plan
-            .expect("join plan should be present");
+        let join_plan = plan.metadata.join_plan.as_ref().unwrap();
+        let recommendation = &plan.metadata.recommended_downstream_plan;
 
         assert_eq!(join_plan.recommended_strategy, "physical_only");
+        assert_eq!(recommendation.strategy, "physical_repartitioning");
+        assert!(!recommendation.requires_operator_rewrite);
+        assert!(recommendation
+            .notes
+            .contains(&"no_join_heavy_keys_detected".to_string()));
         assert!(join_plan.left_heavy_keys.is_empty());
         assert!(join_plan.right_heavy_keys.is_empty());
         assert!(join_plan.shared_heavy_keys.is_empty());
