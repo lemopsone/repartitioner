@@ -7,6 +7,7 @@ use parquet::arrow::ArrowWriter;
 
 use crate::{
     config::OutputConfig,
+    key_encoding::key_value_to_string,
     manifest::{
         write_json_metadata, Manifest, OutputFile, PartitionManifest, PartitionPlan, StatsMetadata,
         METADATA_VERSION,
@@ -186,7 +187,7 @@ fn write_partition_parquet(
                         .rows
                         .get(assignment.row_index)
                         .and_then(|row| row.key_values().get(column))
-                        .cloned()
+                        .and_then(key_value_to_string)
                 })
                 .collect::<Vec<_>>();
             Arc::new(StringArray::from(values)) as ArrayRef

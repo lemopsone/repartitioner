@@ -4,6 +4,7 @@ pub mod dataset;
 pub mod error;
 pub mod hashing;
 pub mod heavy_hitters;
+pub mod key_encoding;
 pub mod manifest;
 pub mod partitioner;
 pub mod planner;

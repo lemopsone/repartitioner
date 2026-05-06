@@ -153,7 +153,7 @@ mod tests {
         let heavy_salt_indexes: Vec<_> = assignments
             .records
             .iter()
-            .filter(|record| record.key.as_deref() == Some("user_id=heavy"))
+            .filter(|record| record.key.as_deref() == Some("7:user_id#utf8:5:heavy"))
             .filter_map(|record| record.salt_index)
             .collect();
 

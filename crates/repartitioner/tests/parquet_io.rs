@@ -22,7 +22,11 @@ fn reads_key_rows_from_temporary_parquet_file() -> Result<()> {
     assert_eq!(dataset.rows.row_count(), 6);
     assert_eq!(stats.metadata.input.distinct_keys, Some(3));
     assert_eq!(
-        stats.metadata.input.key_frequencies.get("user_id=heavy"),
+        stats
+            .metadata
+            .input
+            .key_frequencies
+            .get("7:user_id#utf8:5:heavy"),
         Some(&3)
     );
 
@@ -38,6 +42,100 @@ fn rejects_missing_input_path() {
     let error = reader::read_dataset(&config).expect_err("missing input should fail");
 
     assert!(matches!(error, Error::InputPathNotFound { .. }));
+}
+
+#[test]
+fn reads_int64_key_rows_and_partitions_them() -> Result<()> {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let input = tempdir.path().join("input_int64.parquet");
+    write_int64_user_id_parquet(&input, &[42, 42, 7, 9])?;
+
+    let config = config_for(&input, &tempdir.path().join("out"));
+    let dataset = reader::read_dataset(&config)?;
+    let stats = statistics::compute_statistics(&config, &dataset)?;
+    let plan = planner::build_plan(&config, &stats)?;
+    let assignments = partitioner::assign_partitions(&plan, &dataset)?;
+
+    assert_eq!(dataset.rows.row_count(), 4);
+    assert_eq!(
+        stats
+            .metadata
+            .input
+            .key_frequencies
+            .get("7:user_id#int64:42"),
+        Some(&2)
+    );
+    assert_eq!(assignments.partition_row_counts.iter().sum::<u64>(), 4);
+
+    Ok(())
+}
+
+#[test]
+fn keeps_null_and_empty_string_as_distinct_keys() -> Result<()> {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let input = tempdir.path().join("nullable_strings.parquet");
+    write_nullable_user_id_parquet(&input, &[None, Some(""), Some("heavy")])?;
+
+    let config = config_for(&input, &tempdir.path().join("out"));
+    let dataset = reader::read_dataset(&config)?;
+    let stats = statistics::compute_statistics(&config, &dataset)?;
+
+    assert_eq!(
+        stats.metadata.input.key_frequencies.get("7:user_id#null"),
+        Some(&1)
+    );
+    assert_eq!(
+        stats
+            .metadata
+            .input
+            .key_frequencies
+            .get("7:user_id#utf8:0:"),
+        Some(&1)
+    );
+
+    Ok(())
+}
+
+#[test]
+fn encodes_composite_keys_with_delimiters_deterministically() -> Result<()> {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let input = tempdir.path().join("composite.parquet");
+    write_composite_string_parquet(&input, &[("a=b|c", "eu"), ("a=b|c", "eu"), ("x", "us")])?;
+
+    let config =
+        config_for_key_columns(&input, &tempdir.path().join("out"), &["user_id", "region"]);
+    let dataset = reader::read_dataset(&config)?;
+    let first = statistics::compute_statistics(&config, &dataset)?;
+    let second = statistics::compute_statistics(&config, &dataset)?;
+
+    let encoded = "7:user_id#utf8:5:a=b|c|6:region#utf8:2:eu";
+    assert_eq!(first.metadata.input.key_frequencies.get(encoded), Some(&2));
+    assert_eq!(
+        first.metadata.input.key_frequencies,
+        second.metadata.input.key_frequencies
+    );
+
+    Ok(())
+}
+
+#[test]
+fn detects_heavy_hitter_for_numeric_key() -> Result<()> {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let input = tempdir.path().join("numeric_heavy.parquet");
+    write_int64_user_id_parquet(&input, &[42, 42, 42, 42, 42, 42, 1, 2])?;
+
+    let config = config_for(&input, &tempdir.path().join("out"));
+    let dataset = reader::read_dataset(&config)?;
+    let stats = statistics::compute_statistics(&config, &dataset)?;
+    let plan = planner::build_plan(&config, &stats)?;
+
+    assert!(plan
+        .metadata
+        .heavy_keys
+        .iter()
+        .any(|key| key.key == "7:user_id#int64:42"));
+
+    Ok(())
 }
 
 #[test]
@@ -164,6 +262,16 @@ fn writes_no_op_metadata_without_output_parquet_files() -> Result<()> {
 }
 
 fn config_for(input: &Path, output: &Path) -> Config {
+    config_for_key_columns(input, output, &["user_id"])
+}
+
+fn config_for_key_columns(input: &Path, output: &Path, key_columns: &[&str]) -> Config {
+    let key_columns = key_columns
+        .iter()
+        .map(|column| format!("\"{column}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+
     Config::from_yaml_str(&format!(
         r#"
 dataset:
@@ -172,7 +280,7 @@ dataset:
   format: "parquet"
 
 partitioning:
-  key_columns: ["user_id"]
+  key_columns: [{key_columns}]
   target_partition_size_mb: 128
   max_partitions: 4
   strategy: "adaptive_hash_salt"
@@ -236,6 +344,70 @@ fn write_user_id_parquet(path: &Path, values: &[&str]) -> Result<()> {
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![Arc::new(StringArray::from(user_ids)) as ArrayRef],
+    )?;
+    let file = File::create(path).expect("input parquet should be created");
+    let mut writer = ArrowWriter::try_new(file, schema, None)?;
+    writer.write(&batch)?;
+    writer.close()?;
+
+    Ok(())
+}
+
+fn write_nullable_user_id_parquet(path: &Path, values: &[Option<&str>]) -> Result<()> {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "user_id",
+        DataType::Utf8,
+        true,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(StringArray::from(values.to_vec())) as ArrayRef],
+    )?;
+    let file = File::create(path).expect("input parquet should be created");
+    let mut writer = ArrowWriter::try_new(file, schema, None)?;
+    writer.write(&batch)?;
+    writer.close()?;
+
+    Ok(())
+}
+
+fn write_int64_user_id_parquet(path: &Path, values: &[i64]) -> Result<()> {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "user_id",
+        DataType::Int64,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int64Array::from(values.to_vec())) as ArrayRef],
+    )?;
+    let file = File::create(path).expect("input parquet should be created");
+    let mut writer = ArrowWriter::try_new(file, schema, None)?;
+    writer.write(&batch)?;
+    writer.close()?;
+
+    Ok(())
+}
+
+fn write_composite_string_parquet(path: &Path, values: &[(&str, &str)]) -> Result<()> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("user_id", DataType::Utf8, false),
+        Field::new("region", DataType::Utf8, false),
+    ]));
+    let user_ids = values
+        .iter()
+        .map(|(user_id, _)| Some(*user_id))
+        .collect::<Vec<_>>();
+    let regions = values
+        .iter()
+        .map(|(_, region)| Some(*region))
+        .collect::<Vec<_>>();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(user_ids)) as ArrayRef,
+            Arc::new(StringArray::from(regions)) as ArrayRef,
+        ],
     )?;
     let file = File::create(path).expect("input parquet should be created");
     let mut writer = ArrowWriter::try_new(file, schema, None)?;

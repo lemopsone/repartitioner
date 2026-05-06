@@ -399,7 +399,7 @@ mod tests {
 
         assert_eq!(plan.metadata.output_partitions, 4);
         assert_eq!(plan.metadata.heavy_keys.len(), 1);
-        assert_eq!(plan.metadata.heavy_keys[0].key, "user_id=heavy");
+        assert_eq!(plan.metadata.heavy_keys[0].key, "7:user_id#utf8:5:heavy");
         assert_eq!(plan.metadata.heavy_keys[0].estimated_frequency, 10);
         assert_eq!(plan.metadata.heavy_keys[0].salt_count, 3);
         assert_eq!(plan.metadata.heavy_keys[0].salt_partitions.len(), 3);

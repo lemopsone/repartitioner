@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 
+use crate::key_encoding::{encode_key_part, KeyValue};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Dataset {
     pub rows: Vec<Row>,
@@ -24,7 +26,7 @@ impl Dataset {
         let key_column = key_column.into();
         let rows = values
             .into_iter()
-            .map(|value| Row::from_key_value(key_column.clone(), value.into()))
+            .map(|value| Row::from_key_value(key_column.clone(), KeyValue::Utf8(value.into())))
             .collect();
 
         Self { rows }
@@ -37,21 +39,21 @@ impl Dataset {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
-    key_values: BTreeMap<String, String>,
+    key_values: BTreeMap<String, KeyValue>,
 }
 
 impl Row {
-    pub fn new(key_values: BTreeMap<String, String>) -> Self {
+    pub fn new(key_values: BTreeMap<String, KeyValue>) -> Self {
         Self { key_values }
     }
 
-    pub fn from_key_value(key_column: impl Into<String>, value: impl Into<String>) -> Self {
+    pub fn from_key_value(key_column: impl Into<String>, value: KeyValue) -> Self {
         Self {
-            key_values: BTreeMap::from([(key_column.into(), value.into())]),
+            key_values: BTreeMap::from([(key_column.into(), value)]),
         }
     }
 
-    pub fn key_values(&self) -> &BTreeMap<String, String> {
+    pub fn key_values(&self) -> &BTreeMap<String, KeyValue> {
         &self.key_values
     }
 
@@ -61,7 +63,7 @@ impl Row {
             .map(|column| {
                 self.key_values
                     .get(column)
-                    .map(|value| format!("{column}={value}"))
+                    .map(|value| encode_key_part(column, value))
             })
             .collect::<Option<Vec<_>>>()
             .map(|parts| parts.join("|"))

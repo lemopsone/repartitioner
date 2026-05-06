@@ -1,12 +1,18 @@
 use std::{collections::BTreeMap, fs, fs::File, path::Path};
 
-use arrow_array::{Array, LargeStringArray, RecordBatch, StringArray};
-use arrow_schema::DataType;
+use arrow_array::{
+    Array, BooleanArray, Date32Array, Decimal128Array, Decimal256Array, Int16Array, Int32Array,
+    Int64Array, Int8Array, LargeStringArray, RecordBatch, StringArray, TimestampMicrosecondArray,
+    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt16Array,
+    UInt32Array, UInt64Array, UInt8Array,
+};
+use arrow_schema::{DataType, TimeUnit};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 use crate::{
     config::DatasetFormat,
     dataset::{Dataset, Row},
+    key_encoding::KeyValue,
     Config, Error, Result,
 };
 
@@ -144,7 +150,7 @@ fn read_parquet_dataset(
                 let mut key_values = BTreeMap::new();
                 for (column, column_index) in key_columns.iter().zip(column_indexes.iter()) {
                     let array = batch.column(*column_index);
-                    let value = string_value(column, array.as_ref(), row_index)?;
+                    let value = key_value(column, array.as_ref(), row_index)?;
                     key_values.insert(column.clone(), value);
                 }
                 rows.push(Row::new(key_values));
@@ -156,9 +162,9 @@ fn read_parquet_dataset(
     Ok((Dataset::new(rows), batches))
 }
 
-fn string_value(column: &str, array: &dyn Array, row_index: usize) -> Result<String> {
+fn key_value(column: &str, array: &dyn Array, row_index: usize) -> Result<KeyValue> {
     if array.is_null(row_index) {
-        return Ok(String::new());
+        return Ok(KeyValue::Null);
     }
 
     match array.data_type() {
@@ -167,13 +173,132 @@ fn string_value(column: &str, array: &dyn Array, row_index: usize) -> Result<Str
             .downcast_ref::<StringArray>()
             .expect("Utf8 array should downcast to StringArray")
             .value(row_index)
-            .to_string()),
+            .to_string()
+            .into()),
         DataType::LargeUtf8 => Ok(array
             .as_any()
             .downcast_ref::<LargeStringArray>()
             .expect("LargeUtf8 array should downcast to LargeStringArray")
             .value(row_index)
-            .to_string()),
+            .to_string()
+            .into()),
+        DataType::Int8 => Ok(KeyValue::Int64(
+            array
+                .as_any()
+                .downcast_ref::<Int8Array>()
+                .expect("Int8 array should downcast to Int8Array")
+                .value(row_index) as i64,
+        )),
+        DataType::Int16 => Ok(KeyValue::Int64(
+            array
+                .as_any()
+                .downcast_ref::<Int16Array>()
+                .expect("Int16 array should downcast to Int16Array")
+                .value(row_index) as i64,
+        )),
+        DataType::Int32 => Ok(KeyValue::Int64(
+            array
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("Int32 array should downcast to Int32Array")
+                .value(row_index) as i64,
+        )),
+        DataType::Int64 => Ok(KeyValue::Int64(
+            array
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("Int64 array should downcast to Int64Array")
+                .value(row_index),
+        )),
+        DataType::UInt8 => Ok(KeyValue::UInt64(
+            array
+                .as_any()
+                .downcast_ref::<UInt8Array>()
+                .expect("UInt8 array should downcast to UInt8Array")
+                .value(row_index) as u64,
+        )),
+        DataType::UInt16 => Ok(KeyValue::UInt64(
+            array
+                .as_any()
+                .downcast_ref::<UInt16Array>()
+                .expect("UInt16 array should downcast to UInt16Array")
+                .value(row_index) as u64,
+        )),
+        DataType::UInt32 => Ok(KeyValue::UInt64(
+            array
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .expect("UInt32 array should downcast to UInt32Array")
+                .value(row_index) as u64,
+        )),
+        DataType::UInt64 => Ok(KeyValue::UInt64(
+            array
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .expect("UInt64 array should downcast to UInt64Array")
+                .value(row_index),
+        )),
+        DataType::Boolean => Ok(KeyValue::Boolean(
+            array
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .expect("Boolean array should downcast to BooleanArray")
+                .value(row_index),
+        )),
+        DataType::Date32 => Ok(KeyValue::Date32(
+            array
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .expect("Date32 array should downcast to Date32Array")
+                .value(row_index),
+        )),
+        DataType::Timestamp(TimeUnit::Second, _) => Ok(KeyValue::TimestampMicros(
+            array
+                .as_any()
+                .downcast_ref::<TimestampSecondArray>()
+                .expect("TimestampSecond array should downcast to TimestampSecondArray")
+                .value(row_index)
+                * 1_000_000,
+        )),
+        DataType::Timestamp(TimeUnit::Millisecond, _) => Ok(KeyValue::TimestampMicros(
+            array
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .expect("TimestampMillisecond array should downcast to TimestampMillisecondArray")
+                .value(row_index)
+                * 1_000,
+        )),
+        DataType::Timestamp(TimeUnit::Microsecond, _) => Ok(KeyValue::TimestampMicros(
+            array
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .expect("TimestampMicrosecond array should downcast to TimestampMicrosecondArray")
+                .value(row_index),
+        )),
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => Ok(KeyValue::TimestampMicros(
+            array
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .expect("TimestampNanosecond array should downcast to TimestampNanosecondArray")
+                .value(row_index)
+                / 1_000,
+        )),
+        DataType::Decimal128(precision, scale) => Ok(KeyValue::Decimal(format!(
+            "decimal128({precision},{scale}):{}",
+            array
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .expect("Decimal128 array should downcast to Decimal128Array")
+                .value(row_index)
+        ))),
+        DataType::Decimal256(precision, scale) => Ok(KeyValue::Decimal(format!(
+            "decimal256({precision},{scale}):{}",
+            array
+                .as_any()
+                .downcast_ref::<Decimal256Array>()
+                .expect("Decimal256 array should downcast to Decimal256Array")
+                .value(row_index)
+        ))),
         other => Err(Error::UnsupportedColumnType {
             column: column.to_string(),
             data_type: other.to_string(),

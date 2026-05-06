@@ -245,7 +245,11 @@ mod tests {
         assert_eq!(statistics.metadata.input.mean_key_frequency, 4.0 / 3.0);
         assert_eq!(statistics.metadata.input.max_key_frequency, 2);
         assert_eq!(
-            statistics.metadata.input.key_frequencies.get("user_id=a"),
+            statistics
+                .metadata
+                .input
+                .key_frequencies
+                .get("7:user_id#utf8:1:a"),
             Some(&2)
         );
     }
@@ -266,7 +270,7 @@ mod tests {
         assert_eq!(statistics.metadata.input.heavy_hitter_candidates.len(), 1);
         assert_eq!(
             statistics.metadata.input.heavy_hitters[0].key,
-            "user_id=heavy"
+            "7:user_id#utf8:5:heavy"
         );
         assert_eq!(
             statistics.metadata.input.heavy_hitters[0].estimated_frequency,
