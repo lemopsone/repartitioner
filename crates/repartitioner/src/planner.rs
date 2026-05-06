@@ -481,9 +481,7 @@ mod tests {
         let dataset = input_dataset_with_file_size(
             Dataset::from_key_values(
                 "user_id",
-                ["a", "a", "b", "b", "c", "c", "d", "d"]
-                    .into_iter()
-                    .map(String::from),
+                (0..100).flat_map(|_| ["a", "b", "c", "d"].into_iter().map(String::from)),
             ),
             1024,
         );
@@ -491,6 +489,9 @@ mod tests {
 
         let plan = build_plan(&config, &statistics).expect("plan should build");
 
+        assert!(statistics.metadata.skew.max_mean_imbalance_ratio <= 1.2);
+        assert!(statistics.metadata.input.heavy_hitters.is_empty());
+        assert!(plan.metadata.heavy_keys.is_empty());
         assert_eq!(plan.metadata.action, PlanAction::NoOp);
         assert!(!plan.metadata.rewrite_required);
         assert_eq!(

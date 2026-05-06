@@ -60,11 +60,11 @@ python3 experiments/collect_results.py \
 .venv/bin/python experiments/run_suite.py \
   --run-dir /tmp/repartitioner-suite-smoke \
   --rows 10000 \
-  --distributions single_heavy \
+  --distributions uniform_no_skew,single_heavy \
   --heavy-fractions 0.5 \
   --max-partitions 4 \
   --target-partition-size-mb 16 \
-  --limit 1
+  --limit 2
 ```
 
 Если Spark в окружении временно недоступен, можно проверить только генерацию и
@@ -101,3 +101,9 @@ Runner сохраняет для каждого сценария:
 Для no-op сценариев method-aware Spark-режим может быть `null`, потому что
 preprocessor не материализует технические колонки и Spark читает исходный input
 как reused dataset.
+
+Сценарий `uniform_no_skew` нужен как контрольный пример: если данные уже
+распределены равномерно, heavy hitters отсутствуют и ограничение `L` выполняется,
+метод не обязан физически переписывать dataset. В таком запуске ожидается
+`rewrite_required=false`, `action=no_op`, а `preprocessing_writing_seconds`
+отражает только запись metadata и должен быть близок к нулю.

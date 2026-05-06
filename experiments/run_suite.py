@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_DISTRIBUTIONS = ["uniform", "single_heavy", "multi_heavy", "zipf"]
+DEFAULT_DISTRIBUTIONS = ["uniform_no_skew", "uniform", "single_heavy", "multi_heavy", "zipf"]
 DEFAULT_ROWS = [10_000, 100_000, 1_000_000]
 DEFAULT_HEAVY_FRACTIONS = [0.10, 0.25, 0.50, 0.75]
 DEFAULT_MAX_PARTITIONS = [4, 8, 16, 32]
@@ -29,6 +29,8 @@ SUMMARY_COLUMNS = [
     "max_partitions",
     "target_partition_size_mb",
     "heavy_key_alpha",
+    "rewrite_required",
+    "preprocessing_writing_seconds",
     "preprocessing_total_seconds",
     "spark_baseline_seconds",
     "spark_physical_only_seconds",
@@ -222,6 +224,8 @@ def generate_dataset(case: SuiteCase, input_path: Path) -> dict[str, Any]:
         command.extend(["--heavy-fraction", str(case.heavy_fraction), "--heavy-keys", "4"])
     elif case.distribution == "zipf":
         command.extend(["--zipf-exponent", str(case.zipf_exponent)])
+    elif case.distribution == "uniform_no_skew":
+        command.extend(["--balanced", "--scenario-name", "uniform_no_skew"])
 
     run_command(command, cwd=repo_root())
     return read_json(input_path.with_suffix(input_path.suffix + ".json"))
@@ -316,6 +320,8 @@ def build_summary_row(
         "max_partitions": case.max_partitions,
         "target_partition_size_mb": case.target_partition_size_mb,
         "heavy_key_alpha": case.heavy_key_alpha,
+        "rewrite_required": preprocessor_result.get("rewrite_required"),
+        "preprocessing_writing_seconds": preprocessor_result.get("preprocessing_writing_seconds"),
         "preprocessing_total_seconds": preprocessing_total,
         "spark_baseline_seconds": elapsed(baseline),
         "spark_physical_only_seconds": spark_physical,
@@ -379,6 +385,7 @@ def write_summary(
 def generator_script(distribution: str) -> str:
     mapping = {
         "uniform": "generate_uniform.py",
+        "uniform_no_skew": "generate_uniform.py",
         "single_heavy": "generate_heavy_key.py",
         "multi_heavy": "generate_multi_heavy_key.py",
         "zipf": "generate_zipf.py",
