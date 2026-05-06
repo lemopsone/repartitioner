@@ -16,6 +16,7 @@ class CollectResultsTests(unittest.TestCase):
                 output_dataset / "_partition_plan.json",
                 {
                     "version": "0.2.0",
+                    "strategy": "adaptive_hash_salt",
                     "output_partitions": 2,
                     "target_partition_rows": 10,
                     "job_type": "group_by",
@@ -81,6 +82,7 @@ class CollectResultsTests(unittest.TestCase):
         self.assertEqual(result["after_max_partition_size"], 10)
         self.assertEqual(result["before_cv"], 0.8)
         self.assertEqual(result["after_cv"], 0.0)
+        self.assertEqual(result["partitioning_strategy"], "adaptive_hash_salt")
         self.assertTrue(result["target_rows_satisfied_after"])
         self.assertAlmostEqual(result["skew_reduction_ratio"], 1.0 / 1.8)
 

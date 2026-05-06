@@ -81,6 +81,7 @@ def collect_results(
         "heavy_hitter_count": len(stats_input.get("heavy_hitters", [])),
         "output_partitions": partition_plan.get("output_partitions"),
         "target_partition_rows": partition_plan.get("target_partition_rows"),
+        "partitioning_strategy": partition_plan.get("strategy"),
         "job_type": partition_plan.get("job_type"),
         "downstream_engine": partition_plan.get("downstream_engine"),
         "min_partitions": partition_plan.get("min_partitions"),

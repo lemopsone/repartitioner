@@ -102,6 +102,18 @@ normal keys is disabled because the planner does not know the full set of
 normal keys. Normal rows then use hash fallback unless they belong to a planned
 heavy key.
 
+## Storage-level output sizing
+
+The implemented method is focused on adaptive partitioning with selective
+salting. The writer also controls Parquet output file size by rolling
+`part-xxxxx.parquet` files according to `storage.target_file_size_mb`; this is
+an output-layer optimization, not a separate partitioning strategy.
+
+`partitioning.strategy: "file_size_balancing"` is reserved for a future
+standalone method that would explicitly split oversized input files and coalesce
+small input files. In the current prototype the planner rejects this strategy
+with a clear error and recommends `adaptive_hash_salt`.
+
 ## Metadata
 
 _partition_plan.json should contain:

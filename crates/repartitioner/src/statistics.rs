@@ -752,6 +752,25 @@ resources:
     }
 
     #[test]
+    fn adaptive_hash_salt_still_records_storage_metadata() {
+        let config = example_config();
+        let dataset = InputDataset::from_rows(Dataset::from_key_values(
+            "user_id",
+            ["a", "b"].into_iter().map(String::from),
+        ));
+
+        let statistics = compute_statistics(&config, &dataset).expect("statistics should compute");
+
+        assert_eq!(statistics.metadata.storage.target_file_size_mb, 128);
+        assert_eq!(statistics.metadata.storage.min_file_size_mb, 16);
+        assert_eq!(
+            statistics.metadata.storage.target_file_size_bytes,
+            134_217_728
+        );
+        assert_eq!(statistics.metadata.storage.min_file_size_bytes, 16_777_216);
+    }
+
+    #[test]
     fn stats_contains_before_and_after_skew_for_rewrite() {
         let config = example_config();
         let dataset = InputDataset::from_rows(Dataset::from_key_values(

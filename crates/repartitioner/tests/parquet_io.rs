@@ -301,6 +301,40 @@ fn writes_streaming_output_from_multiple_input_parquet_files() -> Result<()> {
 }
 
 #[test]
+fn writer_rolls_files_by_target_size() -> Result<()> {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let input = tempdir.path().join("rolling_input.parquet");
+    let output = tempdir.path().join("rolling_output");
+    let user_ids = std::iter::repeat_n("heavy".to_string(), 96)
+        .chain((0..24).map(|index| format!("normal_{index:02}")))
+        .collect::<Vec<_>>();
+    write_user_id_row_id_payload_parquet(&input, &user_ids, 64 * 1024)?;
+
+    let config = config_for_small_target(&input, &output);
+    let dataset = reader::read_dataset(&config)?;
+    let mut stats = statistics::compute_statistics(&config, &dataset)?;
+    let plan = planner::build_plan(&config, &stats)?;
+    let assignments = partitioner::assign_partitions(&plan, &dataset)?;
+    stats.set_after_partition_sizes(assignments.partition_row_counts.clone());
+    let write_summary = writer::write_output(
+        &output,
+        &config.output.format,
+        &plan.metadata,
+        &stats.metadata,
+        &assignments,
+        &dataset,
+    )?;
+
+    assert!(write_summary
+        .manifest
+        .partitions
+        .iter()
+        .any(|partition| partition.file_count > 1));
+
+    Ok(())
+}
+
+#[test]
 fn preserves_row_identity_and_payload_after_repartitioning() -> Result<()> {
     let tempdir = tempfile::tempdir().expect("tempdir should be created");
     let input = tempdir.path().join("identity_input.parquet");

@@ -54,6 +54,11 @@ pub enum Error {
     UnsupportedFormat(String),
 
     #[error(
+        "file_size_balancing strategy is not implemented as a standalone planner strategy; use adaptive_hash_salt"
+    )]
+    FileSizeBalancingStrategyNotImplemented,
+
+    #[error(
         "resource limit exceeded: estimated dataset size {estimated_dataset_size_mb} MB exceeds configured memory limit {configured_memory_limit_mb} MB"
     )]
     ResourceLimitExceeded {

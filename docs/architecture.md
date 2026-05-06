@@ -47,6 +47,12 @@ Parquet is the only full read/write adapter in the current prototype. CSV is an
 input adapter for statistics and planning; CSV output is not implemented. A
 supported mixed-format scenario is CSV input with Parquet output.
 
+Output file sizing is implemented in the Parquet writer: large logical
+partitions can be written as multiple `part-xxxxx.parquet` files according to
+`storage.target_file_size_mb`. This is not a standalone file-size balancing
+planner strategy. `partitioning.strategy: "file_size_balancing"` is currently
+reserved for future split/coalesce planning and is rejected with a clear error.
+
 Parquet processing is two-pass:
 
 - pass 1 scans only configured key columns using Parquet projection and retains

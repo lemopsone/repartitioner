@@ -4,7 +4,7 @@ use std::{
 };
 
 use crate::{
-    config::{JobType, NormalKeyAssignment},
+    config::{JobType, NormalKeyAssignment, PartitioningStrategy},
     hashing, heavy_hitters,
     manifest::{
         CostEstimate, HeavyKeyPlan, JoinPlan, NormalKeyPlan, PartitionPlan,
@@ -12,7 +12,7 @@ use crate::{
         SaltPartitionPlan, TechnicalColumns, METADATA_VERSION,
     },
     statistics::ComputedStatistics,
-    targeting, Config, Result,
+    targeting, Config, Error, Result,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -21,6 +21,10 @@ pub struct Plan {
 }
 
 pub fn build_plan(config: &Config, statistics: &ComputedStatistics) -> Result<Plan> {
+    if config.partitioning.strategy == PartitioningStrategy::FileSizeBalancing {
+        return Err(Error::FileSizeBalancingStrategyNotImplemented);
+    }
+
     let target_partitioning = targeting::compute_target_partitioning(
         config,
         statistics.metadata.input.total_rows,
@@ -938,6 +942,28 @@ mod tests {
     }
 
     #[test]
+    fn file_size_balancing_strategy_returns_clear_error() {
+        let config = config_with_strategy("file_size_balancing");
+        let dataset = InputDataset::from_rows(Dataset::from_key_values(
+            "user_id",
+            ["a", "b"].into_iter().map(String::from),
+        ));
+        let statistics = compute_statistics(&config, &dataset).expect("statistics should compute");
+
+        let error =
+            build_plan(&config, &statistics).expect_err("standalone file strategy should fail");
+
+        assert!(matches!(
+            error,
+            crate::Error::FileSizeBalancingStrategyNotImplemented
+        ));
+        assert_eq!(
+            error.to_string(),
+            "file_size_balancing strategy is not implemented as a standalone planner strategy; use adaptive_hash_salt"
+        );
+    }
+
+    #[test]
     fn plan_salts_keys_that_exceed_target_rows_even_without_mean_outliers() {
         let config = config_with_partition_limits(1, 128, 1);
         let rows = Dataset::from_key_values(
@@ -1475,6 +1501,34 @@ partitioning:
   target_partition_size_mb: {target_partition_size_mb}
   max_partitions: {max_partitions}
   strategy: "adaptive_hash_salt"
+  heavy_key_alpha: 2.0
+  seed: 42
+
+job:
+  type: "group_by"
+  downstream_engine: "spark"
+
+resources:
+  local_threads: 8
+  memory_limit_mb: 4096
+"#
+        ))
+        .expect("test config should parse")
+    }
+
+    fn config_with_strategy(strategy: &str) -> Config {
+        Config::from_yaml_str(&format!(
+            r#"
+dataset:
+  input: "./data/input.parquet"
+  output: "./data/output_partitioned"
+  format: "parquet"
+
+partitioning:
+  key_columns: ["user_id"]
+  target_partition_size_mb: 128
+  max_partitions: 4
+  strategy: "{strategy}"
   heavy_key_alpha: 2.0
   seed: 42
 
