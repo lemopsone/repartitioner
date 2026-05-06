@@ -6,8 +6,8 @@ use std::{
 use crate::{
     hashing, heavy_hitters,
     manifest::{
-        HeavyKeyPlan, NormalKeyPlan, PartitionPlan, PartitionPlanFeasibility, SaltPartitionPlan,
-        METADATA_VERSION,
+        CostEstimate, HeavyKeyPlan, NormalKeyPlan, PartitionPlan, PartitionPlanFeasibility,
+        PlanAction, SaltPartitionPlan, METADATA_VERSION,
     },
     statistics::ComputedStatistics,
     targeting, Config, Result,
@@ -89,6 +89,12 @@ pub fn build_plan(config: &Config, statistics: &ComputedStatistics) -> Result<Pl
             salt_partitions,
         });
     }
+    let rewrite_decision = rewrite_decision(config, statistics, target_partition_rows, &heavy_keys);
+    let cost_estimate = cost_estimate(
+        statistics,
+        rewrite_decision.rewrite_required,
+        rewrite_decision.cost_reason.clone(),
+    );
 
     Ok(Plan {
         metadata: PartitionPlan {
@@ -106,12 +112,103 @@ pub fn build_plan(config: &Config, statistics: &ComputedStatistics) -> Result<Pl
                 target_partition_size_satisfied: target_partitioning.target_size_satisfied,
                 reason: target_partitioning.reason,
             },
+            rewrite_required: rewrite_decision.rewrite_required,
+            action: rewrite_decision.action,
+            skip_reason: rewrite_decision.skip_reason,
+            cost_estimate,
             normal_keys,
             heavy_keys,
             hash_function: hashing::HASH_FUNCTION_NAME.to_string(),
             seed: config.partitioning.seed,
         },
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RewriteDecision {
+    rewrite_required: bool,
+    action: PlanAction,
+    skip_reason: Option<String>,
+    cost_reason: String,
+}
+
+fn rewrite_decision(
+    config: &Config,
+    statistics: &ComputedStatistics,
+    target_partition_rows: u64,
+    heavy_keys: &[HeavyKeyPlan],
+) -> RewriteDecision {
+    if config.partitioning.force_rewrite {
+        return rewrite("force_rewrite");
+    }
+
+    if !heavy_keys.is_empty() {
+        return rewrite("heavy_keys_detected");
+    }
+
+    let skew = &statistics.metadata.skew;
+    if skew.max_partition_size > target_partition_rows {
+        return rewrite("max_partition_exceeds_target_rows");
+    }
+
+    if skew.max_mean_imbalance_ratio > config.partitioning.no_op_max_imbalance_ratio {
+        return rewrite("imbalance_ratio_exceeds_no_op_threshold");
+    }
+
+    RewriteDecision {
+        rewrite_required: false,
+        action: PlanAction::NoOp,
+        skip_reason: Some("no_rewrite_needed".to_string()),
+        cost_reason: "rewrite_not_required_no_skew".to_string(),
+    }
+}
+
+fn rewrite(reason: &str) -> RewriteDecision {
+    RewriteDecision {
+        rewrite_required: true,
+        action: PlanAction::Rewrite,
+        skip_reason: None,
+        cost_reason: reason.to_string(),
+    }
+}
+
+fn cost_estimate(
+    statistics: &ComputedStatistics,
+    rewrite_required: bool,
+    reason: String,
+) -> CostEstimate {
+    if !rewrite_required {
+        return CostEstimate {
+            estimated_rows_read: 0,
+            estimated_rows_written: 0,
+            estimated_bytes_read: Some(0),
+            estimated_bytes_written: Some(0),
+            rewrite_required,
+            reason,
+        };
+    }
+
+    let input_bytes = total_input_size_bytes(statistics);
+    CostEstimate {
+        estimated_rows_read: statistics.metadata.input.total_rows,
+        estimated_rows_written: statistics.metadata.input.total_rows,
+        estimated_bytes_read: input_bytes,
+        estimated_bytes_written: input_bytes,
+        rewrite_required,
+        reason,
+    }
+}
+
+fn total_input_size_bytes(statistics: &ComputedStatistics) -> Option<u64> {
+    let total = statistics
+        .metadata
+        .input
+        .input_files
+        .iter()
+        .map(|file| file.size_bytes)
+        .sum::<u64>();
+
+    (total > 0).then_some(total)
 }
 
 fn salt_count(frequency: u64, target_partition_rows: u64) -> usize {
@@ -171,6 +268,7 @@ mod tests {
     use crate::{
         config::DatasetFormat,
         dataset::Dataset,
+        manifest::PlanAction,
         reader::{InputDataset, InputFile},
         statistics::compute_statistics,
         targeting,
@@ -272,6 +370,71 @@ mod tests {
         assert_eq!(plan.metadata.output_partitions, 1);
         assert!(plan.metadata.feasibility.target_partition_size_satisfied);
         assert_eq!(plan.metadata.feasibility.reason, None);
+    }
+
+    #[test]
+    fn uniform_dataset_without_skew_produces_no_op_plan() {
+        let config = config_with_rewrite_controls(false, 1.2);
+        let dataset = input_dataset_with_file_size(
+            Dataset::from_key_values(
+                "user_id",
+                ["a", "a", "b", "b", "c", "c", "d", "d"]
+                    .into_iter()
+                    .map(String::from),
+            ),
+            1024,
+        );
+        let statistics = compute_statistics(&config, &dataset).expect("statistics should compute");
+
+        let plan = build_plan(&config, &statistics).expect("plan should build");
+
+        assert_eq!(plan.metadata.action, PlanAction::NoOp);
+        assert!(!plan.metadata.rewrite_required);
+        assert_eq!(
+            plan.metadata.skip_reason.as_deref(),
+            Some("no_rewrite_needed")
+        );
+        assert_eq!(plan.metadata.cost_estimate.estimated_rows_written, 0);
+        assert_eq!(plan.metadata.cost_estimate.estimated_bytes_written, Some(0));
+    }
+
+    #[test]
+    fn heavy_key_dataset_produces_rewrite_plan() {
+        let config = example_config();
+        let dataset = InputDataset::from_rows(Dataset::from_key_values(
+            "user_id",
+            std::iter::repeat_n("heavy", 40).chain(["a", "b", "c", "d"]),
+        ));
+        let statistics = compute_statistics(&config, &dataset).expect("statistics should compute");
+
+        let plan = build_plan(&config, &statistics).expect("plan should build");
+
+        assert_eq!(plan.metadata.action, PlanAction::Rewrite);
+        assert!(plan.metadata.rewrite_required);
+        assert_eq!(plan.metadata.cost_estimate.reason, "heavy_keys_detected");
+        assert_eq!(plan.metadata.cost_estimate.estimated_rows_written, 44);
+    }
+
+    #[test]
+    fn force_rewrite_overrides_no_op_decision() {
+        let config = config_with_rewrite_controls(true, 1.2);
+        let dataset = input_dataset_with_file_size(
+            Dataset::from_key_values(
+                "user_id",
+                ["a", "a", "b", "b", "c", "c", "d", "d"]
+                    .into_iter()
+                    .map(String::from),
+            ),
+            1024,
+        );
+        let statistics = compute_statistics(&config, &dataset).expect("statistics should compute");
+
+        let plan = build_plan(&config, &statistics).expect("plan should build");
+
+        assert_eq!(plan.metadata.action, PlanAction::Rewrite);
+        assert!(plan.metadata.rewrite_required);
+        assert_eq!(plan.metadata.cost_estimate.reason, "force_rewrite");
+        assert_eq!(plan.metadata.cost_estimate.estimated_rows_written, 8);
     }
 
     #[test]
@@ -436,5 +599,48 @@ resources:
 "#
         ))
         .expect("test config should parse")
+    }
+
+    fn config_with_rewrite_controls(force_rewrite: bool, no_op_max_imbalance_ratio: f64) -> Config {
+        Config::from_yaml_str(&format!(
+            r#"
+dataset:
+  input: "./data/input.parquet"
+  output: "./data/output_partitioned"
+  format: "parquet"
+
+partitioning:
+  key_columns: ["user_id"]
+  target_partition_size_mb: 128
+  max_partitions: 128
+  strategy: "adaptive_hash_salt"
+  heavy_key_alpha: 2.0
+  force_rewrite: {force_rewrite}
+  no_op_max_imbalance_ratio: {no_op_max_imbalance_ratio}
+  seed: 42
+
+job:
+  type: "group_by"
+  downstream_engine: "spark"
+
+resources:
+  local_threads: 8
+  memory_limit_mb: 4096
+"#
+        ))
+        .expect("test config should parse")
+    }
+
+    fn input_dataset_with_file_size(rows: Dataset, size_bytes: u64) -> InputDataset {
+        InputDataset {
+            path: "input.parquet".to_string(),
+            format: DatasetFormat::Parquet,
+            files: vec![InputFile {
+                path: "input.parquet".to_string(),
+                size_bytes,
+            }],
+            rows,
+            batches: Vec::new(),
+        }
     }
 }

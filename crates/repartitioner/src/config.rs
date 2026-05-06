@@ -64,6 +64,14 @@ impl Config {
             });
         }
 
+        if !self.partitioning.no_op_max_imbalance_ratio.is_finite()
+            || self.partitioning.no_op_max_imbalance_ratio <= 0.0
+        {
+            return Err(ConfigValidationError::InvalidNoOpMaxImbalanceRatio {
+                value: self.partitioning.no_op_max_imbalance_ratio,
+            });
+        }
+
         Ok(())
     }
 }
@@ -89,6 +97,8 @@ pub struct PartitioningConfig {
     pub max_partitions: NonZeroUsize,
     pub strategy: PartitioningStrategy,
     pub heavy_key_alpha: f64,
+    pub force_rewrite: bool,
+    pub no_op_max_imbalance_ratio: f64,
     pub seed: u64,
 }
 
@@ -164,6 +174,8 @@ struct RawPartitioningConfig {
     max_partitions: usize,
     strategy: String,
     heavy_key_alpha: f64,
+    force_rewrite: Option<bool>,
+    no_op_max_imbalance_ratio: Option<f64>,
     seed: u64,
 }
 
@@ -211,6 +223,13 @@ impl TryFrom<RawConfig> for Config {
             });
         }
 
+        let no_op_max_imbalance_ratio = raw.partitioning.no_op_max_imbalance_ratio.unwrap_or(1.2);
+        if !no_op_max_imbalance_ratio.is_finite() || no_op_max_imbalance_ratio <= 0.0 {
+            return Err(ConfigValidationError::InvalidNoOpMaxImbalanceRatio {
+                value: no_op_max_imbalance_ratio,
+            });
+        }
+
         let strategy = PartitioningStrategy::from_str(raw.partitioning.strategy.as_str())?;
 
         let config = Config {
@@ -226,6 +245,8 @@ impl TryFrom<RawConfig> for Config {
                 max_partitions,
                 strategy,
                 heavy_key_alpha: raw.partitioning.heavy_key_alpha,
+                force_rewrite: raw.partitioning.force_rewrite.unwrap_or(false),
+                no_op_max_imbalance_ratio,
                 seed: raw.partitioning.seed,
             },
             job: raw.job,
@@ -274,6 +295,8 @@ resources:
         assert_eq!(config.partitioning.min_partitions.get(), 1);
         assert_eq!(config.partitioning.target_partition_size_mb.get(), 128);
         assert_eq!(config.partitioning.max_partitions.get(), 128);
+        assert!(!config.partitioning.force_rewrite);
+        assert_eq!(config.partitioning.no_op_max_imbalance_ratio, 1.2);
         assert_eq!(
             config.partitioning.strategy,
             PartitioningStrategy::AdaptiveHashSalt
@@ -332,6 +355,18 @@ resources:
     }
 
     #[test]
+    fn parses_optional_rewrite_controls() {
+        let config = parse_replacing(
+            "heavy_key_alpha: 2.0",
+            "heavy_key_alpha: 2.0\n  force_rewrite: true\n  no_op_max_imbalance_ratio: 1.5",
+        )
+        .expect("config with rewrite controls should parse");
+
+        assert!(config.partitioning.force_rewrite);
+        assert_eq!(config.partitioning.no_op_max_imbalance_ratio, 1.5);
+    }
+
+    #[test]
     fn rejects_invalid_min_partition_count() {
         let error = parse_replacing(
             "max_partitions: 128",
@@ -354,6 +389,19 @@ resources:
         assert_validation_error(
             error,
             ConfigValidationError::MinPartitionsGreaterThanMax { min: 129, max: 128 },
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_no_op_max_imbalance_ratio() {
+        let error = parse_replacing(
+            "heavy_key_alpha: 2.0",
+            "heavy_key_alpha: 2.0\n  no_op_max_imbalance_ratio: 0.0",
+        )
+        .expect_err("zero no-op ratio should be rejected");
+        assert_validation_error(
+            error,
+            ConfigValidationError::InvalidNoOpMaxImbalanceRatio { value: 0.0 },
         );
     }
 

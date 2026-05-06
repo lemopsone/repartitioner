@@ -38,11 +38,16 @@ def collect_results(
     manifest = read_json(output_dataset / "_manifest.json")
     input_metadata = read_json(input_metadata_path) if input_metadata_path else None
     before_sizes = stats["estimates"]["before_partition_sizes"]
+    input_reused = bool(manifest.get("input_reused", False))
     after_sizes = [partition["row_count"] for partition in manifest["partitions"]]
+    if input_reused and not after_sizes:
+        after_sizes = before_sizes
 
     result = {
         "input": input_metadata,
         "output_dataset": str(output_dataset),
+        "input_reused": input_reused,
+        "dataset_location": manifest.get("dataset_location"),
         "elapsed_seconds": elapsed_seconds,
         "rows": stats["input"]["total_rows"],
         "distinct_keys": stats["input"]["distinct_keys"],
@@ -51,6 +56,10 @@ def collect_results(
         "heavy_hitter_count": len(stats["input"]["heavy_hitters"]),
         "output_partitions": partition_plan["output_partitions"],
         "target_partition_rows": partition_plan["target_partition_rows"],
+        "rewrite_required": partition_plan.get("rewrite_required"),
+        "action": partition_plan.get("action"),
+        "skip_reason": partition_plan.get("skip_reason"),
+        "cost_estimate": partition_plan.get("cost_estimate"),
         "output_file_count": len(manifest["output_files"]),
         "before": partition_summary(before_sizes),
         "after": partition_summary(after_sizes),

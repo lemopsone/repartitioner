@@ -83,6 +83,39 @@ fn writes_partitioned_parquet_dataset_and_reads_it_back() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn writes_no_op_metadata_without_output_parquet_files() -> Result<()> {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let input = tempdir.path().join("input.parquet");
+    let output = tempdir.path().join("no_op");
+    write_user_id_parquet(&input, &["a", "a", "b", "b"])?;
+
+    let config = config_for(&input, &output);
+    let dataset = reader::read_dataset(&config)?;
+    let mut stats = statistics::compute_statistics(&config, &dataset)?;
+    let plan = planner::build_plan(&config, &stats)?;
+    stats.set_after_partition_sizes(stats.metadata.estimates.before_partition_sizes.clone());
+
+    assert!(!plan.metadata.rewrite_required);
+    assert_eq!(plan.metadata.cost_estimate.estimated_rows_written, 0);
+
+    let write_summary =
+        writer::write_no_op_output(&output, &plan.metadata, &stats.metadata, &dataset)?;
+
+    assert!(output.join("_partition_plan.json").is_file());
+    assert!(output.join("_stats.json").is_file());
+    assert!(output.join("_manifest.json").is_file());
+    assert!(write_summary.manifest.input_reused);
+    assert_eq!(
+        write_summary.manifest.dataset_location.as_deref(),
+        Some(input.to_string_lossy().as_ref())
+    );
+    assert!(write_summary.manifest.output_files.is_empty());
+    assert!(!contains_parquet_file(&output));
+
+    Ok(())
+}
+
 fn config_for(input: &Path, output: &Path) -> Config {
     Config::from_yaml_str(&format!(
         r#"
@@ -218,4 +251,19 @@ fn assert_plan_metadata_contains_adaptive_partitioning(output: &Path) {
     assert!(metadata["required_partitions_by_size"].as_u64().is_some());
     assert!(metadata["output_partitions"].as_u64().unwrap_or_default() <= 4);
     assert!(metadata["feasibility"].is_object());
+}
+
+fn contains_parquet_file(dir: &Path) -> bool {
+    std::fs::read_dir(dir)
+        .expect("output directory should be readable")
+        .filter_map(|entry| entry.ok())
+        .any(|entry| {
+            let path = entry.path();
+            if path.is_dir() {
+                contains_parquet_file(&path)
+            } else {
+                path.extension()
+                    .is_some_and(|extension| extension == std::ffi::OsStr::new("parquet"))
+            }
+        })
 }

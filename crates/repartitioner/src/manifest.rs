@@ -19,6 +19,10 @@ pub struct PartitionPlan {
     pub target_partition_rows: u64,
     pub output_partitions: usize,
     pub feasibility: PartitionPlanFeasibility,
+    pub rewrite_required: bool,
+    pub action: PlanAction,
+    pub skip_reason: Option<String>,
+    pub cost_estimate: CostEstimate,
     pub normal_keys: Vec<NormalKeyPlan>,
     pub heavy_keys: Vec<HeavyKeyPlan>,
     pub hash_function: String,
@@ -29,6 +33,23 @@ pub struct PartitionPlan {
 pub struct PartitionPlanFeasibility {
     pub target_partition_size_satisfied: bool,
     pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanAction {
+    NoOp,
+    Rewrite,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CostEstimate {
+    pub estimated_rows_read: u64,
+    pub estimated_rows_written: u64,
+    pub estimated_bytes_read: Option<u64>,
+    pub estimated_bytes_written: Option<u64>,
+    pub rewrite_required: bool,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,6 +129,8 @@ pub struct PartitionEstimates {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifest {
     pub version: String,
+    pub input_reused: bool,
+    pub dataset_location: Option<String>,
     pub output_files: Vec<OutputFile>,
     pub partitions: Vec<PartitionManifest>,
 }
@@ -161,6 +184,17 @@ mod tests {
             feasibility: PartitionPlanFeasibility {
                 target_partition_size_satisfied: true,
                 reason: None,
+            },
+            rewrite_required: true,
+            action: PlanAction::Rewrite,
+            skip_reason: None,
+            cost_estimate: CostEstimate {
+                estimated_rows_read: 10,
+                estimated_rows_written: 10,
+                estimated_bytes_read: Some(2048),
+                estimated_bytes_written: Some(2048),
+                rewrite_required: true,
+                reason: "heavy_keys_detected".to_string(),
             },
             normal_keys: vec![NormalKeyPlan {
                 key: "user_id=7".to_string(),
@@ -234,6 +268,8 @@ mod tests {
 
         let manifest = Manifest {
             version: METADATA_VERSION.to_string(),
+            input_reused: false,
+            dataset_location: None,
             output_files: vec![OutputFile {
                 path: "ap_partition=0/part-00000.parquet".to_string(),
                 partition_id: 0,

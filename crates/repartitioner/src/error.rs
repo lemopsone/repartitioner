@@ -51,7 +51,7 @@ pub enum Error {
     UnsupportedFormat(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum ConfigValidationError {
     #[error("dataset.input must not be empty")]
     MissingInputPath,
@@ -72,6 +72,11 @@ pub enum ConfigValidationError {
         "partitioning.min_partitions must not be greater than partitioning.max_partitions, got {min} > {max}"
     )]
     MinPartitionsGreaterThanMax { min: usize, max: usize },
+
+    #[error(
+        "partitioning.no_op_max_imbalance_ratio must be finite and greater than zero, got {value}"
+    )]
+    InvalidNoOpMaxImbalanceRatio { value: f64 },
 
     #[error("unsupported partitioning.strategy: {value}")]
     InvalidStrategyName { value: String },

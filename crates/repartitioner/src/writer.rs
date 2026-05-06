@@ -90,15 +90,63 @@ pub fn write_output(
 
     let manifest = Manifest {
         version: METADATA_VERSION.to_string(),
+        input_reused: false,
+        dataset_location: None,
         output_files,
         partitions,
     };
 
-    write_json_metadata(output_dir.join("_partition_plan.json"), plan)?;
-    write_json_metadata(output_dir.join("_stats.json"), stats)?;
-    write_json_metadata(output_dir.join("_manifest.json"), &manifest)?;
+    write_metadata_files(output_dir, plan, stats, &manifest)?;
 
     Ok(WriteSummary { manifest })
+}
+
+pub fn write_no_op_output(
+    output_dir: impl AsRef<Path>,
+    plan: &PartitionPlan,
+    stats: &StatsMetadata,
+    dataset: &InputDataset,
+) -> Result<WriteSummary> {
+    let output_dir = output_dir.as_ref();
+    fs::create_dir_all(output_dir).map_err(|source| Error::WriteFile {
+        path: output_dir.to_path_buf(),
+        source,
+    })?;
+
+    let partitions = stats
+        .estimates
+        .before_partition_sizes
+        .iter()
+        .enumerate()
+        .map(|(partition_id, row_count)| PartitionManifest {
+            partition_id,
+            row_count: *row_count,
+            file_count: 0,
+            size_bytes: None,
+        })
+        .collect();
+    let manifest = Manifest {
+        version: METADATA_VERSION.to_string(),
+        input_reused: true,
+        dataset_location: Some(dataset.path.clone()),
+        output_files: Vec::new(),
+        partitions,
+    };
+
+    write_metadata_files(output_dir, plan, stats, &manifest)?;
+
+    Ok(WriteSummary { manifest })
+}
+
+fn write_metadata_files(
+    output_dir: &Path,
+    plan: &PartitionPlan,
+    stats: &StatsMetadata,
+    manifest: &Manifest,
+) -> Result<()> {
+    write_json_metadata(output_dir.join("_partition_plan.json"), plan)?;
+    write_json_metadata(output_dir.join("_stats.json"), stats)?;
+    write_json_metadata(output_dir.join("_manifest.json"), manifest)
 }
 
 fn write_partition_parquet(
