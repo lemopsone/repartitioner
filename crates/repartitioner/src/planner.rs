@@ -4,10 +4,12 @@ use std::{
 };
 
 use crate::{
+    config::JobType,
     hashing, heavy_hitters,
     manifest::{
         CostEstimate, HeavyKeyPlan, NormalKeyPlan, PartitionPlan, PartitionPlanFeasibility,
-        PlanAction, SaltPartitionPlan, TechnicalColumns, METADATA_VERSION,
+        PlanAction, RecommendedDownstreamPlan, SaltPartitionPlan, TechnicalColumns,
+        METADATA_VERSION,
     },
     statistics::ComputedStatistics,
     targeting, Config, Result,
@@ -102,6 +104,9 @@ pub fn build_plan(config: &Config, statistics: &ComputedStatistics) -> Result<Pl
             created_at: creation_timestamp(),
             strategy: config.partitioning.strategy.clone(),
             key_columns: config.partitioning.key_columns.clone(),
+            job_type: config.job.job_type.clone(),
+            downstream_engine: config.job.downstream_engine.clone(),
+            recommended_downstream_plan: recommended_downstream_plan(config),
             min_partitions: config.partitioning.min_partitions.get(),
             max_partitions: config.partitioning.max_partitions.get(),
             target_partition_size_mb: config.partitioning.target_partition_size_mb.get(),
@@ -203,6 +208,98 @@ fn cost_estimate(
         rewrite_required,
         reason,
     }
+}
+
+fn recommended_downstream_plan(config: &Config) -> RecommendedDownstreamPlan {
+    let partition_column = technical_column_name(
+        config.output.include_technical_columns,
+        &config.output.partition_column,
+    );
+    let salt_column = technical_column_name(
+        config.output.include_technical_columns,
+        &config.output.salt_column,
+    );
+    let heavy_key_column = technical_column_name(
+        config.output.include_technical_columns,
+        &config.output.heavy_key_column,
+    );
+    let mut notes = technical_column_notes(config);
+
+    let (strategy, requires_operator_rewrite, partial_group_keys, final_group_keys, join_keys) =
+        match &config.job.job_type {
+            JobType::Scan => (
+                "physical_repartitioning",
+                false,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ),
+            JobType::Filter => {
+                notes.push("filter_selectivity_unknown".to_string());
+                (
+                    "physical_repartitioning_with_filter_awareness",
+                    false,
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+            }
+            JobType::GroupBy => (
+                "two_stage_group_by",
+                true,
+                partial_group_keys(config),
+                config.partitioning.key_columns.clone(),
+                Vec::new(),
+            ),
+            JobType::Join => (
+                "salted_heavy_key_join",
+                true,
+                Vec::new(),
+                Vec::new(),
+                config.partitioning.key_columns.clone(),
+            ),
+            JobType::Generic => (
+                "physical_repartitioning",
+                false,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ),
+        };
+
+    RecommendedDownstreamPlan {
+        job_type: config.job.job_type.clone(),
+        strategy: strategy.to_string(),
+        requires_operator_rewrite,
+        partition_column,
+        salt_column,
+        heavy_key_column,
+        partial_group_keys,
+        final_group_keys,
+        join_keys,
+        notes,
+    }
+}
+
+fn technical_column_name(included: bool, column: &str) -> Option<String> {
+    included.then(|| column.to_string())
+}
+
+fn technical_column_notes(config: &Config) -> Vec<String> {
+    if config.output.include_technical_columns {
+        Vec::new()
+    } else {
+        vec!["technical_columns_disabled".to_string()]
+    }
+}
+
+fn partial_group_keys(config: &Config) -> Vec<String> {
+    let mut keys = Vec::new();
+    if config.output.include_technical_columns {
+        keys.push(config.output.partition_column.clone());
+    }
+    keys.extend(config.partitioning.key_columns.clone());
+    keys
 }
 
 fn total_input_size_bytes(statistics: &ComputedStatistics) -> Option<u64> {
@@ -572,6 +669,81 @@ mod tests {
         assert!(json.contains("\"target_partition_rows\":4"));
         assert!(json.contains("\"required_partitions_by_size\""));
         assert!(json.contains("\"feasibility\""));
+        assert!(json.contains("\"recommended_downstream_plan\""));
+        assert!(json.contains("\"two_stage_group_by\""));
+    }
+
+    #[test]
+    fn group_by_plan_recommends_two_stage_group_by() {
+        let config = config_with_job_type("group_by");
+        let plan = build_plan_for_job_config(&config);
+
+        let recommendation = &plan.metadata.recommended_downstream_plan;
+        assert_eq!(plan.metadata.job_type, crate::config::JobType::GroupBy);
+        assert_eq!(recommendation.strategy, "two_stage_group_by");
+        assert!(recommendation.requires_operator_rewrite);
+        assert_eq!(
+            recommendation.partition_column.as_deref(),
+            Some("_rp_partition_id")
+        );
+        assert_eq!(recommendation.salt_column.as_deref(), Some("_rp_salt"));
+        assert_eq!(
+            recommendation.heavy_key_column.as_deref(),
+            Some("_rp_is_heavy_key")
+        );
+        assert_eq!(
+            recommendation.partial_group_keys,
+            vec!["_rp_partition_id".to_string(), "user_id".to_string()]
+        );
+        assert_eq!(recommendation.final_group_keys, vec!["user_id".to_string()]);
+    }
+
+    #[test]
+    fn join_plan_recommends_salted_heavy_key_join() {
+        let config = config_with_job_type("join");
+        let plan = build_plan_for_job_config(&config);
+
+        let recommendation = &plan.metadata.recommended_downstream_plan;
+        assert_eq!(plan.metadata.job_type, crate::config::JobType::Join);
+        assert_eq!(recommendation.strategy, "salted_heavy_key_join");
+        assert!(recommendation.requires_operator_rewrite);
+        assert_eq!(recommendation.join_keys, vec!["user_id".to_string()]);
+        assert_eq!(recommendation.salt_column.as_deref(), Some("_rp_salt"));
+        assert_eq!(
+            recommendation.heavy_key_column.as_deref(),
+            Some("_rp_is_heavy_key")
+        );
+    }
+
+    #[test]
+    fn scan_plan_does_not_require_operator_rewrite() {
+        let config = config_with_job_type("scan");
+        let plan = build_plan_for_job_config(&config);
+
+        let recommendation = &plan.metadata.recommended_downstream_plan;
+        assert_eq!(plan.metadata.job_type, crate::config::JobType::Scan);
+        assert_eq!(recommendation.strategy, "physical_repartitioning");
+        assert!(!recommendation.requires_operator_rewrite);
+        assert_eq!(
+            recommendation.partition_column.as_deref(),
+            Some("_rp_partition_id")
+        );
+    }
+
+    #[test]
+    fn filter_plan_records_unknown_selectivity_note() {
+        let config = config_with_job_type("filter");
+        let plan = build_plan_for_job_config(&config);
+
+        let recommendation = &plan.metadata.recommended_downstream_plan;
+        assert_eq!(
+            recommendation.strategy,
+            "physical_repartitioning_with_filter_awareness"
+        );
+        assert!(!recommendation.requires_operator_rewrite);
+        assert!(recommendation
+            .notes
+            .contains(&"filter_selectivity_unknown".to_string()));
     }
 
     fn config_with_partition_limits(
@@ -635,6 +807,43 @@ resources:
 "#
         ))
         .expect("test config should parse")
+    }
+
+    fn config_with_job_type(job_type: &str) -> Config {
+        Config::from_yaml_str(&format!(
+            r#"
+dataset:
+  input: "./data/input.parquet"
+  output: "./data/output_partitioned"
+  format: "parquet"
+
+partitioning:
+  key_columns: ["user_id"]
+  target_partition_size_mb: 128
+  max_partitions: 4
+  strategy: "adaptive_hash_salt"
+  heavy_key_alpha: 2.0
+  seed: 42
+
+job:
+  type: "{job_type}"
+  downstream_engine: "spark"
+
+resources:
+  local_threads: 8
+  memory_limit_mb: 4096
+"#
+        ))
+        .expect("test config should parse")
+    }
+
+    fn build_plan_for_job_config(config: &Config) -> Plan {
+        let dataset = InputDataset::from_rows(Dataset::from_key_values(
+            "user_id",
+            ["heavy", "heavy", "heavy", "heavy", "a", "b", "c", "d"],
+        ));
+        let statistics = compute_statistics(config, &dataset).expect("statistics should compute");
+        build_plan(config, &statistics).expect("plan should build")
     }
 
     fn input_dataset_with_file_size(rows: Dataset, size_bytes: u64) -> InputDataset {

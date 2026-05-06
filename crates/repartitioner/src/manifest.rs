@@ -2,7 +2,10 @@ use std::{collections::BTreeMap, fs, path::Path};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{config::PartitioningStrategy, Error, Result};
+use crate::{
+    config::{DownstreamEngine, JobType, PartitioningStrategy},
+    Error, Result,
+};
 
 pub const METADATA_VERSION: &str = "0.1.0";
 
@@ -12,6 +15,9 @@ pub struct PartitionPlan {
     pub created_at: String,
     pub strategy: PartitioningStrategy,
     pub key_columns: Vec<String>,
+    pub job_type: JobType,
+    pub downstream_engine: DownstreamEngine,
+    pub recommended_downstream_plan: RecommendedDownstreamPlan,
     pub min_partitions: usize,
     pub max_partitions: usize,
     pub target_partition_size_mb: u64,
@@ -59,6 +65,20 @@ pub struct TechnicalColumns {
     pub partition_column: String,
     pub salt_column: String,
     pub heavy_key_column: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecommendedDownstreamPlan {
+    pub job_type: JobType,
+    pub strategy: String,
+    pub requires_operator_rewrite: bool,
+    pub partition_column: Option<String>,
+    pub salt_column: Option<String>,
+    pub heavy_key_column: Option<String>,
+    pub partial_group_keys: Vec<String>,
+    pub final_group_keys: Vec<String>,
+    pub join_keys: Vec<String>,
+    pub notes: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -184,6 +204,20 @@ mod tests {
             created_at: "2026-05-02T00:00:00Z".to_string(),
             strategy: PartitioningStrategy::AdaptiveHashSalt,
             key_columns: vec!["user_id".to_string()],
+            job_type: JobType::GroupBy,
+            downstream_engine: DownstreamEngine::Spark,
+            recommended_downstream_plan: RecommendedDownstreamPlan {
+                job_type: JobType::GroupBy,
+                strategy: "two_stage_group_by".to_string(),
+                requires_operator_rewrite: true,
+                partition_column: Some("_rp_partition_id".to_string()),
+                salt_column: Some("_rp_salt".to_string()),
+                heavy_key_column: Some("_rp_is_heavy_key".to_string()),
+                partial_group_keys: vec!["_rp_partition_id".to_string(), "user_id".to_string()],
+                final_group_keys: vec!["user_id".to_string()],
+                join_keys: Vec::new(),
+                notes: Vec::new(),
+            },
             min_partitions: 1,
             max_partitions: 4,
             target_partition_size_mb: 128,
@@ -245,6 +279,9 @@ mod tests {
         assert!(json.contains("\"normal_keys\""));
         assert!(json.contains("\"salt_count\":3"));
         assert!(json.contains("\"salt_partitions\""));
+        assert!(json.contains("\"job_type\":\"group_by\""));
+        assert!(json.contains("\"recommended_downstream_plan\""));
+        assert!(json.contains("\"two_stage_group_by\""));
     }
 
     #[test]
