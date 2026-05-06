@@ -83,5 +83,22 @@ python3 spark_pipeline/run_join.py \
   --csv-report reports/join-heavy.csv
 ```
 
+Для `join` отчёт также может содержать режим `method_aware`. Он включается
+флагом `--include-method-aware` или автоматически при наличии
+`_partition_plan.json`. Поддерживаемые стратегии берутся из
+`recommended_downstream_plan.strategy`:
+
+- `broadcast_join`: Spark broadcast join правой стороны.
+- `physical_repartitioning`: обычный join без operator rewrite.
+- `salted_heavy_key_join`: split normal/heavy left side и join heavy keys по
+  исходному ключу и `_rp_salt`.
+- `heavy_key_isolation_join`: аналогичная изоляция heavy-key subset по union
+  heavy keys.
+
+Если метод-aware join нельзя выполнить безопасно, отчёт содержит строку
+`mode = method_aware`, `skipped = true` и `skip_reason`, например
+`composite_join_key_unsupported`, `missing_technical_columns` или
+`partition_plan_job_type_not_join`.
+
 Если не указывать флаг `--join-right`, скрипт собирает правую часть из оригинального датасета
 до начала замеров времени. Эти действия не попадают в генерируемые отчеты.

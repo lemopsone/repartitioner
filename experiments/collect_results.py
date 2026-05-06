@@ -86,6 +86,7 @@ def collect_results(
         "feasibility": partition_plan.get("feasibility"),
         "technical_columns": partition_plan.get("technical_columns"),
         "recommended_downstream_plan": partition_plan.get("recommended_downstream_plan"),
+        "join_plan": partition_plan.get("join_plan"),
         "rewrite_required": partition_plan.get("rewrite_required"),
         "action": partition_plan.get("action"),
         "skip_reason": partition_plan.get("skip_reason"),

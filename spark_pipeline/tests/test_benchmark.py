@@ -3,6 +3,8 @@ from __future__ import annotations
 import unittest
 
 from spark_pipeline.benchmark import (
+    heavy_key_literals_for_join,
+    method_aware_join_skip_reason,
     resolve_method_aware_partial_group_keys,
     resolve_method_aware_partition_column,
     resolve_method_aware_salt_column,
@@ -119,6 +121,126 @@ class StructuredHeavyKeyTests(unittest.TestCase):
                 side="shared",
                 key_column="user_id",
             )
+
+
+def join_partition_plan(strategy: str = "salted_heavy_key_join") -> dict:
+    return {
+        "job_type": "join",
+        "key_columns": ["user_id"],
+        "technical_columns": {
+            "included": True,
+            "partition_column": "_rp_partition_id",
+            "salt_column": "_rp_salt",
+            "heavy_key_column": "_rp_is_heavy_key",
+        },
+        "recommended_downstream_plan": {
+            "strategy": strategy,
+            "join_keys": ["user_id"],
+        },
+        "heavy_keys": [
+            {
+                "key": "7:user_id#utf8:5:heavy",
+                "structured_key": {
+                    "encoded": "7:user_id#utf8:5:heavy",
+                    "parts": [
+                        {"column": "user_id", "value_type": "utf8", "value": "heavy"}
+                    ],
+                },
+                "salt_count": 3,
+            }
+        ],
+        "join_plan": {
+            "right_side_size_mb": 2,
+            "broadcast_threshold_mb": 10,
+            "left_heavy_key_values": [
+                {
+                    "encoded": "7:user_id#utf8:5:heavy",
+                    "parts": [
+                        {"column": "user_id", "value_type": "utf8", "value": "heavy"}
+                    ],
+                }
+            ],
+            "right_heavy_key_values": [
+                {
+                    "encoded": "7:user_id#utf8:5:heavy",
+                    "parts": [
+                        {"column": "user_id", "value_type": "utf8", "value": "heavy"}
+                    ],
+                }
+            ],
+            "shared_heavy_key_values": [
+                {
+                    "encoded": "7:user_id#utf8:5:heavy",
+                    "parts": [
+                        {"column": "user_id", "value_type": "utf8", "value": "heavy"}
+                    ],
+                }
+            ],
+        },
+    }
+
+
+class MethodAwareJoinTests(unittest.TestCase):
+    def test_method_aware_join_skips_composite_key_with_reason(self) -> None:
+        plan = join_partition_plan()
+        plan["recommended_downstream_plan"]["join_keys"] = ["user_id", "region"]
+        dataframe = FakeDataFrame(["user_id", "_rp_partition_id", "_rp_salt", "_rp_is_heavy_key"])
+
+        reason = method_aware_join_skip_reason(
+            dataframe,
+            plan,
+            key_column="user_id",
+            input_reused=False,
+        )
+
+        self.assertEqual(reason, "composite_join_key_unsupported")
+
+    def test_method_aware_join_uses_broadcast_for_broadcast_strategy(self) -> None:
+        plan = join_partition_plan("broadcast_join")
+        dataframe = FakeDataFrame(["user_id", "_rp_partition_id", "_rp_salt", "_rp_is_heavy_key"])
+
+        reason = method_aware_join_skip_reason(
+            dataframe,
+            plan,
+            key_column="user_id",
+            input_reused=False,
+        )
+
+        self.assertIsNone(reason)
+        self.assertEqual(plan["recommended_downstream_plan"]["strategy"], "broadcast_join")
+
+    def test_method_aware_join_uses_salt_column_for_salted_strategy(self) -> None:
+        plan = join_partition_plan("salted_heavy_key_join")
+        dataframe = FakeDataFrame(["user_id", "_rp_partition_id", "_rp_salt", "_rp_is_heavy_key"])
+
+        reason = method_aware_join_skip_reason(
+            dataframe,
+            plan,
+            key_column="user_id",
+            input_reused=False,
+        )
+        heavy_literals = heavy_key_literals_for_join(
+            plan,
+            strategy="salted_heavy_key_join",
+            key_column="user_id",
+        )
+
+        self.assertIsNone(reason)
+        self.assertEqual(plan["technical_columns"]["salt_column"], "_rp_salt")
+        self.assertEqual(heavy_literals[0]["encoded"], "7:user_id#utf8:5:heavy")
+
+    def test_method_aware_join_reports_missing_technical_columns(self) -> None:
+        plan = join_partition_plan("salted_heavy_key_join")
+        dataframe = FakeDataFrame(["user_id"])
+
+        reason = method_aware_join_skip_reason(
+            dataframe,
+            plan,
+            key_column="user_id",
+            input_reused=False,
+        )
+
+        self.assertEqual(reason, "missing_technical_columns")
 
 
 if __name__ == "__main__":

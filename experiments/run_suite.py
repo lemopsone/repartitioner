@@ -449,11 +449,15 @@ def read_json(path: Path) -> dict[str, Any]:
 def elapsed(result: dict[str, Any] | None) -> float | None:
     if result is None:
         return None
+    if result.get("skipped"):
+        return None
     return result.get("elapsed_seconds")
 
 
 def correctness(result: dict[str, Any] | None, key: str) -> bool | None:
     if result is None:
+        return None
+    if result.get("skipped"):
         return None
     return (result.get("correctness") or {}).get(key)
 

@@ -11,6 +11,7 @@ from typing import Callable, Iterable
 
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
+from pyspark.sql import types as T
 
 
 @dataclass
@@ -26,6 +27,8 @@ class BenchmarkResult:
     spark_app_id: str
     correctness: dict
     extra: dict
+    skipped: bool = False
+    skip_reason: str | None = None
 
 
 def main() -> None:
@@ -106,24 +109,21 @@ def run_from_args(args: argparse.Namespace, workload_override: str | None = None
                     )
                 )
             elif workload_name == "join":
-                for mode, label, path, dataframe in [
-                    ("baseline", "original", args.original, original),
-                    ("physical_only", "preprocessed", args.preprocessed, preprocessed),
-                ]:
-                    if args.warmup:
-                        dataframe.select(args.key_column).limit(1).count()
-
-                    results.append(
-                        run_join(
-                            spark,
-                            dataframe,
-                            right,
-                            mode=mode,
-                            dataset_label=label,
-                            dataset_path=path,
-                            key_column=args.key_column,
-                        )
+                results.extend(
+                    run_join_benchmark(
+                        spark,
+                        original,
+                        preprocessed,
+                        right,
+                        original_path=args.original,
+                        preprocessed_path=args.preprocessed,
+                        key_column=args.key_column,
+                        partition_plan=partition_plan,
+                        include_method_aware=(args.include_method_aware or partition_plan is not None),
+                        input_reused=input_reused,
+                        warmup=args.warmup,
                     )
+                )
             else:
                 raise ValueError(f"unsupported workload: {workload_name}")
 
@@ -196,6 +196,84 @@ def run_group_by_benchmark(
         )
         method_aware.correctness = correctness_against_baseline(method_aware, baseline)
         results.append(method_aware)
+
+    return results
+
+
+def run_join_benchmark(
+    spark: SparkSession,
+    original: DataFrame,
+    preprocessed: DataFrame,
+    right: DataFrame,
+    *,
+    original_path: Path,
+    preprocessed_path: Path,
+    key_column: str,
+    partition_plan: dict | None,
+    include_method_aware: bool,
+    input_reused: bool,
+    warmup: bool,
+) -> list[BenchmarkResult]:
+    if warmup:
+        original.select(key_column).limit(1).count()
+    baseline = run_join(
+        spark,
+        original,
+        right,
+        mode="baseline",
+        dataset_label="original",
+        dataset_path=original_path,
+        key_column=key_column,
+    )
+    baseline.correctness = correctness_against_baseline(baseline, baseline)
+
+    if warmup:
+        preprocessed.select(key_column).limit(1).count()
+    physical_only = run_join(
+        spark,
+        preprocessed,
+        right,
+        mode="physical_only",
+        dataset_label="preprocessed",
+        dataset_path=preprocessed_path,
+        key_column=key_column,
+    )
+    physical_only.correctness = correctness_against_baseline(physical_only, baseline)
+
+    results = [baseline, physical_only]
+    if include_method_aware:
+        skip_reason = method_aware_join_skip_reason(
+            preprocessed,
+            partition_plan,
+            key_column=key_column,
+            input_reused=input_reused,
+        )
+        if skip_reason is not None:
+            results.append(
+                skipped_benchmark_result(
+                    spark,
+                    preprocessed,
+                    workload="join",
+                    mode="method_aware",
+                    dataset_label="preprocessed",
+                    dataset_path=preprocessed_path,
+                    skip_reason=skip_reason,
+                    extra={"method_aware_join_supported": False},
+                )
+            )
+        else:
+            if warmup:
+                preprocessed.select(key_column).limit(1).count()
+            method_aware = run_method_aware_join(
+                spark,
+                preprocessed,
+                right,
+                partition_plan=partition_plan or {},
+                key_column=key_column,
+                dataset_path=preprocessed_path,
+            )
+            method_aware.correctness = correctness_against_baseline(method_aware, baseline)
+            results.append(method_aware)
 
     return results
 
@@ -330,6 +408,177 @@ def run_join(
     )
 
 
+def run_method_aware_join(
+    spark: SparkSession,
+    left: DataFrame,
+    right: DataFrame,
+    *,
+    partition_plan: dict,
+    key_column: str,
+    dataset_path: Path,
+) -> BenchmarkResult:
+    recommendation = partition_plan.get("recommended_downstream_plan") or {}
+    strategy = recommendation.get("strategy") or "generic_join_repartitioning"
+    join_plan = partition_plan.get("join_plan") or {}
+    technical = partition_plan.get("technical_columns") or {}
+    salt_column = technical.get("salt_column")
+    heavy_key_column = technical.get("heavy_key_column")
+
+    if strategy == "broadcast_join":
+        def action() -> dict:
+            joined = left.join(F.broadcast(right), on=key_column, how="inner")
+            metrics = collect_join_metrics(joined, key_column)
+            metrics["right_replication_rows"] = 0
+            return metrics
+
+        extra = {
+            "strategy": strategy,
+            "method_aware_operator_rewrite": True,
+            "right_side_size_mb": join_plan.get("right_side_size_mb"),
+            "broadcast_threshold_mb": join_plan.get("broadcast_threshold_mb"),
+        }
+    elif strategy == "physical_repartitioning":
+        def action() -> dict:
+            joined = left.join(right, on=key_column, how="inner")
+            metrics = collect_join_metrics(joined, key_column)
+            metrics["right_replication_rows"] = 0
+            return metrics
+
+        extra = {
+            "strategy": strategy,
+            "method_aware_operator_rewrite": False,
+        }
+    elif strategy in {"salted_heavy_key_join", "heavy_key_isolation_join"}:
+        heavy_side = "shared" if strategy == "salted_heavy_key_join" else "union"
+        heavy_key_literals = heavy_key_literals_for_join(
+            partition_plan,
+            strategy=strategy,
+            key_column=key_column,
+        )
+        heavy_condition = heavy_key_filter_condition(key_column, heavy_key_literals)
+        salt_mapping = build_salt_mapping_dataframe(
+            spark,
+            partition_plan,
+            key_column=key_column,
+            salt_column=salt_column,
+            key_data_type=right.schema[key_column].dataType,
+            heavy_key_literals=heavy_key_literals,
+        )
+
+        def action() -> dict:
+            left_heavy = left.where((F.col(heavy_key_column) == F.lit(True)) | heavy_condition)
+            left_normal = left.where(~heavy_condition)
+            right_heavy = right.where(heavy_condition)
+            right_normal = right.join(
+                right_heavy.select(key_column).dropDuplicates([key_column]),
+                key_column,
+                "left_anti",
+            )
+            right_heavy_replicated = right_heavy.join(salt_mapping, on=key_column, how="inner")
+            left_heavy_salted = left_heavy.where(F.col(salt_column).isNotNull())
+            left_heavy_unsalted = left_heavy.where(F.col(salt_column).isNull())
+            heavy_joined_salted = left_heavy_salted.join(
+                right_heavy_replicated,
+                on=[key_column, salt_column],
+                how="inner",
+            )
+            heavy_joined_unsalted = left_heavy_unsalted.join(
+                right_heavy,
+                on=key_column,
+                how="inner",
+            )
+            normal_joined = left_normal.join(right_normal, on=key_column, how="inner")
+            result = normal_joined.unionByName(
+                heavy_joined_salted,
+                allowMissingColumns=True,
+            ).unionByName(
+                heavy_joined_unsalted,
+                allowMissingColumns=True,
+            )
+            metrics = collect_join_metrics(result, key_column)
+            metrics["right_replication_rows"] = right_heavy_replicated.count()
+            return metrics
+
+        extra = {
+            "strategy": strategy,
+            "heavy_key_count": len(heavy_key_literals),
+            "heavy_key_side": heavy_side,
+            "salt_column": salt_column,
+            "heavy_key_column": heavy_key_column,
+            "method_aware_operator_rewrite": True,
+        }
+    else:
+        def action() -> dict:
+            joined = left.join(right, on=key_column, how="inner")
+            metrics = collect_join_metrics(joined, key_column)
+            metrics["right_replication_rows"] = 0
+            return metrics
+
+        extra = {
+            "strategy": strategy,
+            "method_aware_operator_rewrite": True,
+            "degraded_reason": "unsupported_join_strategy",
+        }
+
+    elapsed, metrics = timed(action)
+    return BenchmarkResult(
+        workload="join",
+        mode="method_aware",
+        dataset_label="preprocessed",
+        dataset_path=str(dataset_path),
+        elapsed_seconds=elapsed,
+        rows=metrics["rows"],
+        result_rows=metrics["result_rows"],
+        partitions=left.rdd.getNumPartitions(),
+        spark_app_id=spark.sparkContext.applicationId,
+        correctness={},
+        extra={
+            **extra,
+            "right_partitions": right.rdd.getNumPartitions(),
+            "right_replication_rows": metrics["right_replication_rows"],
+        },
+    )
+
+
+def collect_join_metrics(joined: DataFrame, key_column: str) -> dict:
+    row = joined.agg(
+        F.count(F.lit(1)).alias("rows"),
+        F.countDistinct(key_column).alias("result_rows"),
+    ).collect()[0]
+    return {
+        "rows": int(row["rows"] or 0),
+        "result_rows": int(row["result_rows"] or 0),
+    }
+
+
+def skipped_benchmark_result(
+    spark: SparkSession,
+    dataframe: DataFrame,
+    *,
+    workload: str,
+    mode: str,
+    dataset_label: str,
+    dataset_path: Path,
+    skip_reason: str,
+    extra: dict | None = None,
+) -> BenchmarkResult:
+    return BenchmarkResult(
+        workload=workload,
+        mode=mode,
+        dataset_label=dataset_label,
+        dataset_path=str(dataset_path),
+        elapsed_seconds=0.0,
+        rows=0,
+        result_rows=0,
+        partitions=dataframe.rdd.getNumPartitions(),
+        spark_app_id=spark.sparkContext.applicationId,
+        correctness={},
+        extra={**(extra or {}), "skip_reason": skip_reason},
+        skipped=True,
+        skip_reason=skip_reason,
+    )
+
+
 def prepare_join_right(
     spark: SparkSession,
     original: DataFrame,
@@ -375,6 +624,68 @@ def resolve_preprocessed_data_path(preprocessed_path: Path, manifest: dict | Non
     if manifest and manifest.get("input_reused") and manifest.get("dataset_location"):
         return Path(manifest["dataset_location"])
     return preprocessed_path
+
+
+def method_aware_join_skip_reason(
+    left: DataFrame,
+    partition_plan: dict | None,
+    *,
+    key_column: str,
+    input_reused: bool,
+) -> str | None:
+    if partition_plan is None:
+        return "partition_plan_missing"
+    if input_reused:
+        return "input_reused"
+    if partition_plan.get("job_type") != "join":
+        return "partition_plan_job_type_not_join"
+
+    recommendation = partition_plan.get("recommended_downstream_plan") or {}
+    join_keys = recommendation.get("join_keys") or partition_plan.get("key_columns") or []
+    if len(join_keys) != 1:
+        return "composite_join_key_unsupported"
+    if join_keys[0] != key_column:
+        return "join_key_mismatch"
+
+    technical = partition_plan.get("technical_columns") or {}
+    if not technical.get("included", False):
+        return "missing_technical_columns"
+    technical_columns = [
+        technical.get("partition_column"),
+        technical.get("salt_column"),
+        technical.get("heavy_key_column"),
+    ]
+    if any(not column or column not in left.columns for column in technical_columns):
+        return "missing_technical_columns"
+
+    strategy = recommendation.get("strategy")
+    if strategy not in {
+        "broadcast_join",
+        "physical_repartitioning",
+        "salted_heavy_key_join",
+        "heavy_key_isolation_join",
+    }:
+        return "unsupported_join_strategy"
+
+    try:
+        if strategy == "salted_heavy_key_join":
+            heavy_key_literals_for_join(
+                partition_plan,
+                strategy=strategy,
+                key_column=key_column,
+            )
+        elif strategy == "heavy_key_isolation_join":
+            heavy_key_literals_for_join(
+                partition_plan,
+                strategy=strategy,
+                key_column=key_column,
+            )
+    except ValueError as exc:
+        if "single-column heavy keys only" in str(exc):
+            return "composite_join_key_unsupported"
+        return "invalid_structured_heavy_keys"
+
+    return None
 
 
 def resolve_method_aware_partition_column(
@@ -537,6 +848,121 @@ def single_column_heavy_key_literals(
     return literals
 
 
+def heavy_key_literals_for_join(
+    partition_plan: dict,
+    *,
+    strategy: str,
+    key_column: str,
+) -> list[dict]:
+    join_plan = partition_plan.get("join_plan") or {}
+    if strategy == "salted_heavy_key_join":
+        plan_keys = join_plan.get("shared_heavy_key_values") or []
+    elif strategy == "heavy_key_isolation_join":
+        plan_keys = unique_plan_keys(
+            list(join_plan.get("left_heavy_key_values") or [])
+            + list(join_plan.get("right_heavy_key_values") or [])
+        )
+    else:
+        plan_keys = []
+
+    literals = []
+    for plan_key in plan_keys:
+        parts = plan_key.get("parts") or []
+        if len(parts) != 1:
+            raise ValueError(
+                "method-aware join currently supports single-column heavy keys only; "
+                f"got {len(parts)} parts for encoded key {plan_key.get('encoded')}"
+            )
+        part = parts[0]
+        if part.get("column") != key_column:
+            raise ValueError(
+                "method-aware join heavy key column does not match benchmark key column; "
+                f"expected {key_column}, got {part.get('column')}"
+            )
+        literals.append(
+            {
+                "encoded": plan_key.get("encoded"),
+                "column": part.get("column"),
+                "value_type": part.get("value_type"),
+                "value": part.get("value"),
+            }
+        )
+
+    return literals
+
+
+def unique_plan_keys(plan_keys: Iterable[dict]) -> list[dict]:
+    unique = []
+    seen = set()
+    for plan_key in plan_keys:
+        encoded = plan_key.get("encoded")
+        if encoded not in seen:
+            unique.append(plan_key)
+            seen.add(encoded)
+    return unique
+
+
+def heavy_key_filter_condition(key_column: str, heavy_key_literals: list[dict]):
+    condition = F.lit(False)
+    for heavy_key in heavy_key_literals:
+        value_type = heavy_key.get("value_type")
+        value = spark_literal_value(value_type, heavy_key.get("value"))
+        if value_type == "null":
+            next_condition = F.col(key_column).isNull()
+        else:
+            next_condition = F.col(key_column) == F.lit(value)
+        condition = condition | next_condition
+    return condition
+
+
+def build_salt_mapping_dataframe(
+    spark: SparkSession,
+    partition_plan: dict,
+    *,
+    key_column: str,
+    salt_column: str,
+    key_data_type: T.DataType,
+    heavy_key_literals: list[dict],
+) -> DataFrame:
+    salt_counts = salt_counts_by_encoded_key(partition_plan)
+    rows = []
+    for heavy_key in heavy_key_literals:
+        encoded = heavy_key.get("encoded")
+        salt_count = salt_counts.get(encoded, 1)
+        value = spark_literal_value(heavy_key.get("value_type"), heavy_key.get("value"))
+        for salt_index in range(salt_count):
+            rows.append((value, salt_index))
+
+    schema = T.StructType(
+        [
+            T.StructField(key_column, key_data_type, True),
+            T.StructField(salt_column, T.IntegerType(), False),
+        ]
+    )
+    return spark.createDataFrame(rows, schema)
+
+
+def salt_counts_by_encoded_key(partition_plan: dict) -> dict[str, int]:
+    counts = {}
+    for heavy_key in partition_plan.get("heavy_keys") or []:
+        encoded = heavy_key.get("key")
+        structured = heavy_key.get("structured_key") or {}
+        encoded = structured.get("encoded") or encoded
+        if encoded:
+            counts[encoded] = int(heavy_key.get("salt_count") or 1)
+    return counts
+
+
+def spark_literal_value(value_type: str | None, value: str | None):
+    if value_type == "null":
+        return None
+    if value_type in {"int64", "uint64", "date32", "timestamp_micros"}:
+        return int(value)
+    if value_type == "boolean":
+        return str(value).lower() == "true"
+    return value
+
+
 def unique_preserving_order(values: Iterable[str]) -> list[str]:
     unique: list[str] = []
     seen: set[str] = set()
@@ -566,6 +992,8 @@ def write_reports(results: Iterable[BenchmarkResult], json_report: Path, csv_rep
                 "result_rows",
                 "partitions",
                 "spark_app_id",
+                "skipped",
+                "skip_reason",
                 "correctness_json",
                 "extra_json",
             ],
@@ -583,6 +1011,8 @@ def write_reports(results: Iterable[BenchmarkResult], json_report: Path, csv_rep
                     "result_rows": row["result_rows"],
                     "partitions": row["partitions"],
                     "spark_app_id": row["spark_app_id"],
+                    "skipped": row["skipped"],
+                    "skip_reason": row["skip_reason"],
                     "correctness_json": json.dumps(row["correctness"], sort_keys=True),
                     "extra_json": json.dumps(row["extra"], sort_keys=True),
                 }
