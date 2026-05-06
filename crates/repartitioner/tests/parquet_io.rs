@@ -1,4 +1,4 @@
-use std::{fs::File, path::Path, sync::Arc};
+use std::{fs, fs::File, path::Path, sync::Arc};
 
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Int64Array, RecordBatch, StringArray, UInt32Array,
@@ -20,6 +20,10 @@ fn reads_key_rows_from_temporary_parquet_file() -> Result<()> {
     let stats = statistics::compute_statistics(&config, &dataset)?;
 
     assert_eq!(dataset.rows.row_count(), 6);
+    assert!(
+        dataset.batches.is_empty(),
+        "Parquet reader should not retain full RecordBatch values after the key scan"
+    );
     assert_eq!(stats.metadata.input.distinct_keys, Some(3));
     assert_eq!(
         stats
@@ -222,6 +226,57 @@ fn omits_technical_columns_when_disabled() -> Result<()> {
         .schema()
         .field_with_name("_rp_is_heavy_key")
         .is_err());
+
+    Ok(())
+}
+
+#[test]
+fn writes_streaming_output_from_multiple_input_parquet_files() -> Result<()> {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let input_dir = tempdir.path().join("input_parts");
+    let output = tempdir.path().join("partitioned_multi_file");
+    fs::create_dir_all(&input_dir).expect("input dir should be created");
+
+    let first_values = std::iter::repeat_n("heavy", 12)
+        .chain(["a", "b", "c"])
+        .collect::<Vec<_>>();
+    let second_values = std::iter::repeat_n("heavy", 12)
+        .chain(["d", "e", "f"])
+        .collect::<Vec<_>>();
+    write_user_id_with_payload_parquet(&input_dir.join("part-00000.parquet"), &first_values)?;
+    write_user_id_with_payload_parquet(&input_dir.join("part-00001.parquet"), &second_values)?;
+
+    let config = config_for(&input_dir, &output);
+    let dataset = reader::read_dataset(&config)?;
+    let mut stats = statistics::compute_statistics(&config, &dataset)?;
+    let plan = planner::build_plan(&config, &stats)?;
+    let assignments = partitioner::assign_partitions(&plan, &dataset)?;
+    stats.set_after_partition_sizes(assignments.partition_row_counts.clone());
+    let write_summary = writer::write_output(
+        &output,
+        &plan.metadata,
+        &stats.metadata,
+        &assignments,
+        &dataset,
+    )?;
+
+    let read_back_config = config_for(&output, &tempdir.path().join("unused"));
+    let read_back = reader::read_dataset(&read_back_config)?;
+
+    assert_eq!(dataset.rows.row_count(), 30);
+    assert_eq!(read_back.rows.row_count(), 30);
+    assert!(!write_summary.manifest.output_files.is_empty());
+    assert_eq!(
+        write_summary
+            .manifest
+            .partitions
+            .iter()
+            .map(|partition| partition.row_count)
+            .sum::<u64>(),
+        30
+    );
+    assert_output_schema_contains_payload_columns(&output, &write_summary.manifest.output_files);
+    assert_output_contains_technical_columns(&output, &write_summary.manifest.output_files);
 
     Ok(())
 }
