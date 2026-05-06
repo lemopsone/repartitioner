@@ -117,6 +117,17 @@ pub struct StatsMetadata {
     pub skew: SkewStats,
     pub estimates: PartitionEstimates,
     pub resources: ResourceEstimate,
+    pub timing: Option<TimingMetadata>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TimingMetadata {
+    pub read_seconds: f64,
+    pub statistics_seconds: f64,
+    pub planning_seconds: f64,
+    pub assignment_seconds: f64,
+    pub writing_seconds: f64,
+    pub total_seconds: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -340,6 +351,14 @@ mod tests {
                 memory_limit_exceeded: false,
                 warnings: Vec::new(),
             },
+            timing: Some(TimingMetadata {
+                read_seconds: 0.1,
+                statistics_seconds: 0.2,
+                planning_seconds: 0.3,
+                assignment_seconds: 0.4,
+                writing_seconds: 0.5,
+                total_seconds: 1.5,
+            }),
         };
 
         let manifest = Manifest {
@@ -372,6 +391,8 @@ mod tests {
         assert!(stats_value["skew"].is_object());
         assert!(stats_value["estimates"].is_object());
         assert!(stats_value["resources"].is_object());
+        assert_eq!(stats_value["timing"]["read_seconds"].as_f64(), Some(0.1));
+        assert_eq!(stats_value["timing"]["total_seconds"].as_f64(), Some(1.5));
         assert!(stats_json.contains("\"total_rows\":10"));
         assert!(stats_json.contains("\"coefficient_of_variation\":0.0"));
         assert_eq!(manifest_value["version"].as_str(), Some("0.2.0"));

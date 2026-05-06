@@ -75,7 +75,7 @@ pub fn write_no_op_output(
     Ok(WriteSummary { manifest })
 }
 
-pub(crate) fn write_metadata_files(
+pub fn write_metadata_files(
     output_dir: &Path,
     plan: &PartitionPlan,
     stats: &StatsMetadata,

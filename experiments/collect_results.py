@@ -42,6 +42,7 @@ def collect_results(
     partition_plan_version = partition_plan.get("version")
     stats_version = stats.get("version")
     manifest_version = manifest.get("version")
+    timing = stats.get("timing") or {}
     before_sizes = stats_estimates.get("before_partition_sizes", [])
     input_reused = bool(manifest.get("input_reused", False))
     manifest_partitions = manifest.get("partitions", [])
@@ -60,6 +61,13 @@ def collect_results(
         "input_reused": input_reused,
         "dataset_location": manifest.get("dataset_location"),
         "elapsed_seconds": elapsed_seconds,
+        "preprocessing_timing": timing,
+        "preprocessing_read_seconds": timing.get("read_seconds"),
+        "preprocessing_statistics_seconds": timing.get("statistics_seconds"),
+        "preprocessing_planning_seconds": timing.get("planning_seconds"),
+        "preprocessing_assignment_seconds": timing.get("assignment_seconds"),
+        "preprocessing_writing_seconds": timing.get("writing_seconds"),
+        "preprocessing_total_seconds": timing.get("total_seconds"),
         "rows": stats_input.get("total_rows"),
         "distinct_keys": stats_input.get("distinct_keys"),
         "mean_key_frequency": stats_input.get("mean_key_frequency"),

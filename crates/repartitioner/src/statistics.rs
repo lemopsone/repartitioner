@@ -4,7 +4,7 @@ use crate::{
     hashing, heavy_hitters,
     manifest::{
         HeavyKeyPlan, InputFileStats, InputStats, PartitionEstimates, ResourceEstimate, SkewStats,
-        StatsMetadata, METADATA_VERSION,
+        StatsMetadata, TimingMetadata, METADATA_VERSION,
     },
     reader::InputDataset,
     targeting, Config, Error, Result,
@@ -18,6 +18,10 @@ pub struct ComputedStatistics {
 impl ComputedStatistics {
     pub fn set_after_partition_sizes(&mut self, partition_sizes: Vec<u64>) {
         self.metadata.estimates.after_partition_sizes = partition_sizes;
+    }
+
+    pub fn set_timing(&mut self, timing: TimingMetadata) {
+        self.metadata.timing = Some(timing);
     }
 }
 
@@ -82,6 +86,7 @@ pub fn compute_statistics(config: &Config, dataset: &InputDataset) -> Result<Com
             after_partition_sizes: vec![0; target_partitioning.output_partitions],
         },
         resources,
+        timing: None,
     };
 
     Ok(ComputedStatistics { metadata })
