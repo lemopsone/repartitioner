@@ -73,13 +73,19 @@ output:
 Проверка форматирования Rust-кода:
 
 ```bash
-cargo fmt --check
+cargo fmt --all -- --check
+```
+
+Проверка clippy без предупреждений:
+
+```bash
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 Полный набор Rust-тестов:
 
 ```bash
-cargo test
+cargo test --workspace
 ```
 
 Проверка сборки CLI:
@@ -91,21 +97,25 @@ cargo build -p repartitioner
 Проверка Python-скриптов на синтаксические ошибки:
 
 ```bash
-python -m compileall experiments spark_pipeline datasets
+python -m compileall datasets experiments spark_pipeline
 ```
 
 Если в локальном окружении команда `python` отсутствует, использовать
 интерпретатор из виртуального окружения:
 
 ```bash
-.venv/bin/python -m compileall experiments spark_pipeline datasets
+.venv/bin/python -m compileall datasets experiments spark_pipeline
 ```
+
+Эти команды совпадают с минимальным GitHub Actions workflow в
+`.github/workflows/ci.yml`.
 
 ## Baseline RP-00
 
 На момент фиксации RP-00 выполнены проверки:
 
-- `cargo fmt --check` - проходит.
-- `cargo test` - проходит.
+- `cargo fmt --all -- --check` - проходит.
+- `cargo clippy --workspace --all-targets -- -D warnings` - проходит.
+- `cargo test --workspace` - проходит.
 - `cargo build -p repartitioner` - проходит.
-- `.venv/bin/python -m compileall experiments spark_pipeline datasets` - проходит.
+- `.venv/bin/python -m compileall datasets experiments spark_pipeline` - проходит.
