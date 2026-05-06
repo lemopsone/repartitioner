@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 from spark_pipeline.benchmark import (
+    benchmark_summary,
     comparable_join_checksum_column_names,
     heavy_key_literals_for_join,
     logical_result_columns,
@@ -268,6 +269,44 @@ class CorrectnessHelperTests(unittest.TestCase):
         )
 
         self.assertEqual(columns, ["user_id", "join_payload", "payload"])
+
+    def test_benchmark_summary_reports_method_aware_fields(self) -> None:
+        summary = benchmark_summary(
+            [
+                {
+                    "workload": "join",
+                    "mode": "baseline",
+                    "elapsed_seconds": 1.0,
+                    "skipped": False,
+                    "correctness": {},
+                    "extra": {},
+                },
+                {
+                    "workload": "join",
+                    "mode": "physical_only",
+                    "elapsed_seconds": 2.0,
+                    "skipped": False,
+                    "correctness": {},
+                    "extra": {},
+                },
+                {
+                    "workload": "join",
+                    "mode": "method_aware",
+                    "elapsed_seconds": 3.0,
+                    "skipped": False,
+                    "correctness": {"checksum_matches_baseline": True},
+                    "extra": {"strategy": "salted_heavy_key_join"},
+                },
+            ]
+        )
+
+        self.assertEqual(summary["spark_baseline_seconds"], 1.0)
+        self.assertEqual(summary["spark_physical_only_seconds"], 2.0)
+        self.assertEqual(summary["spark_method_aware_seconds"], 3.0)
+        self.assertEqual(summary["spark_method_aware_join_seconds"], 3.0)
+        self.assertTrue(summary["join_checksum_correctness"])
+        self.assertTrue(summary["method_aware_join_applied"])
+        self.assertEqual(summary["method_aware_join_strategy"], "salted_heavy_key_join")
 
 
 if __name__ == "__main__":

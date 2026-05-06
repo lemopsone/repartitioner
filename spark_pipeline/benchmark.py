@@ -7,7 +7,7 @@ import json
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Any, Callable, Iterable
 
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
@@ -1238,7 +1238,10 @@ def write_reports(results: Iterable[BenchmarkResult], json_report: Path, csv_rep
     rows = [asdict(result) for result in results]
     json_report.parent.mkdir(parents=True, exist_ok=True)
     csv_report.parent.mkdir(parents=True, exist_ok=True)
-    json_report.write_text(json.dumps({"results": rows}, indent=2), encoding="utf-8")
+    json_report.write_text(
+        json.dumps({"summary": benchmark_summary(rows), "results": rows}, indent=2),
+        encoding="utf-8",
+    )
 
     with csv_report.open("w", encoding="utf-8", newline="") as file:
         writer = csv.DictWriter(
@@ -1278,6 +1281,55 @@ def write_reports(results: Iterable[BenchmarkResult], json_report: Path, csv_rep
                     "extra_json": json.dumps(row["extra"], sort_keys=True),
                 }
             )
+
+
+def benchmark_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    group_by = results_by_workload_and_mode(rows, "group_by")
+    join = results_by_workload_and_mode(rows, "join")
+    active = group_by or join
+
+    active_method_aware = active.get("method_aware")
+    join_method_aware = join.get("method_aware")
+    group_by_method_aware = group_by.get("method_aware")
+
+    return {
+        "spark_baseline_seconds": elapsed_seconds(active.get("baseline")),
+        "spark_physical_only_seconds": elapsed_seconds(active.get("physical_only")),
+        "spark_method_aware_seconds": elapsed_seconds(active_method_aware),
+        "spark_method_aware_join_seconds": elapsed_seconds(join_method_aware),
+        "group_by_exact_correctness": correctness_value(
+            group_by_method_aware,
+            "exact_group_counts_match",
+        ),
+        "join_checksum_correctness": correctness_value(
+            join_method_aware,
+            "checksum_matches_baseline",
+        ),
+        "method_aware_join_applied": bool(join_method_aware and not join_method_aware.get("skipped")),
+        "method_aware_join_skipped": join_method_aware.get("skipped") if join_method_aware else None,
+        "method_aware_join_skip_reason": join_method_aware.get("skip_reason") if join_method_aware else None,
+        "method_aware_join_strategy": ((join_method_aware or {}).get("extra") or {}).get("strategy"),
+    }
+
+
+def results_by_workload_and_mode(rows: list[dict[str, Any]], workload: str) -> dict[str, dict[str, Any]]:
+    return {
+        row["mode"]: row
+        for row in rows
+        if row.get("workload") == workload
+    }
+
+
+def elapsed_seconds(row: dict[str, Any] | None) -> float | None:
+    if row is None or row.get("skipped"):
+        return None
+    return row.get("elapsed_seconds")
+
+
+def correctness_value(row: dict[str, Any] | None, key: str) -> bool | None:
+    if row is None or row.get("skipped"):
+        return None
+    return (row.get("correctness") or {}).get(key)
 
 
 if __name__ == "__main__":

@@ -29,6 +29,10 @@ class CollectResultsTests(unittest.TestCase):
                     "recommended_downstream_plan": {},
                     "rewrite_required": True,
                     "action": "rewrite",
+                    "cost_estimate": {
+                        "estimated_rows_written": 20,
+                        "estimated_bytes_written": 2048,
+                    },
                 },
             )
             write_json(
@@ -49,11 +53,13 @@ class CollectResultsTests(unittest.TestCase):
                     },
                     "before_skew": {
                         "max_partition_size": 18,
+                        "mean_partition_size": 10.0,
                         "max_mean_imbalance_ratio": 1.8,
                         "coefficient_of_variation": 0.8,
                     },
                     "after_skew": {
                         "max_partition_size": 10,
+                        "mean_partition_size": 10.0,
                         "max_mean_imbalance_ratio": 1.0,
                         "coefficient_of_variation": 0.0,
                     },
@@ -80,8 +86,12 @@ class CollectResultsTests(unittest.TestCase):
 
         self.assertEqual(result["before_max_partition_size"], 18)
         self.assertEqual(result["after_max_partition_size"], 10)
+        self.assertEqual(result["before_mean_partition_size"], 10.0)
+        self.assertEqual(result["after_mean_partition_size"], 10.0)
         self.assertEqual(result["before_cv"], 0.8)
         self.assertEqual(result["after_cv"], 0.0)
+        self.assertEqual(result["cost_estimated_rows_written"], 20)
+        self.assertEqual(result["cost_estimated_bytes_written"], 2048)
         self.assertEqual(result["partitioning_strategy"], "adaptive_hash_salt")
         self.assertTrue(result["target_rows_satisfied_after"])
         self.assertAlmostEqual(result["skew_reduction_ratio"], 1.0 / 1.8)

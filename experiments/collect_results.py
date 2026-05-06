@@ -52,6 +52,7 @@ def collect_results(
     after_sizes = [partition.get("row_count", 0) for partition in manifest_partitions]
     if input_reused and not after_sizes:
         after_sizes = before_sizes
+    cost_estimate = partition_plan.get("cost_estimate") or {}
 
     result = {
         "metadata_versions": {
@@ -94,7 +95,9 @@ def collect_results(
         "rewrite_required": partition_plan.get("rewrite_required"),
         "action": partition_plan.get("action"),
         "skip_reason": partition_plan.get("skip_reason"),
-        "cost_estimate": partition_plan.get("cost_estimate"),
+        "cost_estimate": cost_estimate,
+        "cost_estimated_rows_written": cost_estimate.get("estimated_rows_written"),
+        "cost_estimated_bytes_written": cost_estimate.get("estimated_bytes_written"),
         "heavy_hitter_detection": stats.get("heavy_hitter_detection"),
         "storage": stats.get("storage"),
         "resources": stats.get("resources"),
@@ -103,6 +106,8 @@ def collect_results(
         "partition_bound": partition_bound,
         "before_max_partition_size": before_skew.get("max_partition_size"),
         "after_max_partition_size": after_skew.get("max_partition_size"),
+        "before_mean_partition_size": before_skew.get("mean_partition_size"),
+        "after_mean_partition_size": after_skew.get("mean_partition_size"),
         "before_max_mean_ratio": before_skew.get("max_mean_imbalance_ratio"),
         "after_max_mean_ratio": after_skew.get("max_mean_imbalance_ratio"),
         "before_cv": before_skew.get("coefficient_of_variation"),

@@ -19,6 +19,13 @@ def main() -> None:
     parser.add_argument("--result", required=True, type=Path, help="Collected result JSON path.")
     parser.add_argument("--config", type=Path, help="Optional config path to write/use.")
     parser.add_argument("--key-column", default="user_id")
+    parser.add_argument("--job-type", choices=["group_by", "join"], default="group_by")
+    parser.add_argument(
+        "--join-right",
+        type=Path,
+        help="Right-side Parquet dataset for join-oriented planning.",
+    )
+    parser.add_argument("--broadcast-threshold-mb", type=int, default=10)
     parser.add_argument("--target-partition-size-mb", type=int, default=128)
     parser.add_argument("--target-file-size-mb", type=int, default=128)
     parser.add_argument("--min-file-size-mb", type=int, default=16)
@@ -43,6 +50,8 @@ def main() -> None:
         help="Optional generator metadata JSON. Defaults to <input>.json for files.",
     )
     args = parser.parse_args()
+    if args.job_type == "join" and args.join_right is None:
+        raise SystemExit("--join-right is required when --job-type=join")
 
     config_path = args.config or args.result.with_suffix(".config.yaml")
     write_config(
@@ -59,6 +68,9 @@ def main() -> None:
         approximate_capacity=args.approximate_capacity,
         seed=args.seed,
         force_rewrite=args.force_rewrite,
+        job_type=args.job_type,
+        join_right=args.join_right,
+        broadcast_threshold_mb=args.broadcast_threshold_mb,
     )
 
     command = ["cargo", "run", "-p", "repartitioner"]
@@ -127,13 +139,32 @@ def write_config(
     heavy_hitter_mode: str = "exact",
     approximate_capacity: int = 10_000,
     force_rewrite: bool = False,
+    job_type: str = "group_by",
+    join_right: Path | None = None,
+    broadcast_threshold_mb: int = 10,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     force_rewrite_line = "  force_rewrite: true\n" if force_rewrite else ""
+    join_section = ""
+    if job_type == "join":
+        if join_right is None:
+            raise ValueError("join_right is required for job_type=join")
+        join_section = f"""
+join:
+  left_input: "{input_path}"
+  right_input: "{join_right}"
+  join_keys: ["{key_column}"]
+  right_side_mode: "broadcast_if_small"
+  broadcast_threshold_mb: {broadcast_threshold_mb}
+"""
+
     path.write_text(
         f"""dataset:
   input: "{input_path}"
-  output: "{output_path}"
+  input_format: "parquet"
+
+output:
+  path: "{output_path}"
   format: "parquet"
 
 partitioning:
@@ -154,8 +185,9 @@ storage:
   min_file_size_mb: {min_file_size_mb}
 
 job:
-  type: "group_by"
+  type: "{job_type}"
   downstream_engine: "spark"
+{join_section}
 
 resources:
   local_threads: 1

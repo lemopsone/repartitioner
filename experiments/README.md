@@ -48,8 +48,10 @@ python3 experiments/collect_results.py \
 
 По умолчанию запускается матрица:
 
-- распределения: `uniform_no_skew`, `uniform`, `single_heavy`,
-  `multi_heavy`, `zipf`;
+- сценарии groupBy: `uniform_no_skew`, `single_heavy`, `multi_heavy`,
+  `zipf`, `normal_key_hash_skew`;
+- сценарии join: `small_right_join`, `shared_heavy_join`,
+  `one_sided_heavy_join`;
 - количество строк: `10000`, `100000`, `1000000`;
 - доля heavy key: `0.1`, `0.25`, `0.5`, `0.75`;
 - максимум партиций: `4`, `8`, `16`, `32`;
@@ -61,7 +63,7 @@ python3 experiments/collect_results.py \
 .venv/bin/python experiments/run_suite.py \
   --run-dir /tmp/repartitioner-suite-smoke \
   --rows 10000 \
-  --distributions uniform_no_skew,single_heavy \
+  --distributions uniform_no_skew,single_heavy,small_right_join \
   --heavy-fractions 0.5 \
   --max-partitions 4 \
   --target-partition-size-mb 16 \
@@ -82,9 +84,14 @@ preprocessor:
 Сценарный runner сохраняет для каждого сценария:
 
 - сгенерированный dataset и `input.parquet.json`;
-- YAML-конфиг preprocessor-а;
+- для join-сценариев — правую сторону `right.parquet`;
+- YAML-конфиг preprocessor-а как `config.yaml`;
+- metadata результата: `_partition_plan.json`, `_stats.json`,
+  `_manifest.json`;
 - JSON-результат preprocessor-а;
-- JSON/CSV-отчёт Spark benchmark-а.
+- JSON/CSV-отчёт Spark benchmark-а как `spark_report.json` и
+  `spark_report.csv`;
+- локальный `summary.csv` для конкретного сценария.
 
 Итоговые файлы:
 
@@ -93,12 +100,15 @@ preprocessor:
 
 В `summary.csv` отдельно фиксируются времена только Spark и end-to-end времена:
 
+- `preprocessing_total_seconds`;
+- `preprocessing_writing_seconds`;
 - `before_max_mean_ratio`;
 - `after_max_mean_ratio`;
 - `skew_reduction_ratio`;
 - `spark_baseline_seconds`;
 - `spark_physical_only_seconds`;
 - `spark_method_aware_seconds`;
+- `spark_method_aware_join_seconds`;
 - `end_to_end_physical_only_seconds`;
 - `end_to_end_method_aware_seconds`.
 
@@ -106,13 +116,28 @@ preprocessor:
 
 - `before_max_partition_size`;
 - `after_max_partition_size`;
+- `before_mean_partition_size`;
+- `after_mean_partition_size`;
 - `before_cv`;
 - `after_cv`;
 - `target_rows_satisfied_after`;
+- `rewrite_required`;
+- `cost_estimated_rows_written`;
+- `cost_estimated_bytes_written`;
 - `heavy_hitter_count`;
 - `output_partitions`;
 - `output_file_count`;
 - `partitioning_strategy`.
+
+Поля корректности Spark:
+
+- `group_by_exact_correctness` — точное совпадение counts по каждому ключу
+  для method-aware groupBy;
+- `join_checksum_correctness` — совпадение checksum результата join с
+  baseline;
+- `method_aware_join_applied`, `method_aware_join_skipped`,
+  `method_aware_join_skip_reason`, `method_aware_join_strategy` — статус
+  применения method-aware join.
 
 Для no-op сценариев method-aware Spark-режим может быть `null`, потому что
 preprocessor не материализует технические колонки и Spark читает исходный input
@@ -123,6 +148,19 @@ preprocessor не материализует технические колонк
 метод не обязан физически переписывать dataset. В таком запуске ожидается
 `rewrite_required=false`, `action=no_op`, а `preprocessing_writing_seconds`
 отражает только запись metadata и должен быть близок к нулю.
+
+Сценарий `normal_key_hash_skew` генерирует набор normal keys, которые
+детерминированно попадают в одну hash-партицию при фиксированном seed. Он нужен
+для проверки load-aware assignment без heavy hitters.
+
+Join-сценарии разделены по ожидаемой рекомендации planner-а:
+
+- `small_right_join` — правая сторона мала, ожидается рекомендация
+  `broadcast_join`;
+- `shared_heavy_join` — heavy key присутствует на обеих сторонах, ожидается
+  `salted_heavy_key_join`;
+- `one_sided_heavy_join` — heavy key выражен только на одной стороне, ожидается
+  `heavy_key_isolation_join`.
 
 ## Границы интерпретации
 
