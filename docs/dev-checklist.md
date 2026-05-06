@@ -54,6 +54,20 @@ output:
 - Parquet: чтение и запись.
 - CSV: чтение для статистики и планирования; запись CSV не реализована.
 
+## Область применимости прототипа
+
+При обновлении документации и текстов ВКР важно не расширять заявленную область
+реализации сверх фактического состояния кода:
+
+- основной метод: adaptive key placement, selective salting и optional no-op;
+- Parquet adapter: полноценное чтение и запись;
+- CSV adapter: только чтение;
+- Spark groupBy benchmark: baseline, physical-only и method-aware;
+- Spark join benchmark: baseline, physical-only и экспериментальный
+  method-aware для безопасных single-key сценариев;
+- `file_size_balancing`: не standalone strategy, а перспектива; сейчас
+  реализован только rolling выходных Parquet-файлов в writer-е.
+
 ## Базовые команды проверки
 
 Проверка форматирования Rust-кода:

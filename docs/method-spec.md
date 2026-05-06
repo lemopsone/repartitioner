@@ -2,7 +2,20 @@
 
 ## Goal
 
-Build an adaptive partitioning plan from computed statistics and use it to rewrite the input dataset into a more balanced physical layout.
+Build an adaptive partitioning plan from computed statistics and use it to
+rewrite the input dataset into a more balanced physical layout when rewriting
+is justified. If the input layout already satisfies the target bounds and skew
+constraints, the method may choose `no_op` and write metadata only.
+
+The implemented method is:
+
+- adaptive key placement for normal keys;
+- selective salting for heavy keys;
+- optional no-op to avoid unnecessary rewrite cost;
+- job-aware metadata for downstream scan/filter/group_by/join workloads.
+
+The method is format-independent at the conceptual level. The prototype uses
+concrete I/O adapters to demonstrate the method on local datasets.
 
 ## Input
 
@@ -20,10 +33,34 @@ Build an adaptive partitioning plan from computed statistics and use it to rewri
 
 ## Output
 
-- Repartitioned dataset D'.
+- Repartitioned dataset D', or reused input dataset when action is `no_op`.
 - Partitioning plan P.
 - Statistics file S.
 - Manifest M.
+
+## Method And Prototype Scope
+
+Method-level model:
+
+- input dataset D;
+- key columns K;
+- downstream job parameters C;
+- resource controls R;
+- target partition bound L;
+- maximum output partition count N;
+- adaptive partitioning plan P.
+
+Prototype support:
+
+- Parquet input: full read support.
+- Parquet output: full write support with Spark-compatible Hive-style
+  `rp_partition=<id>` directories.
+- CSV input: supported for statistics and planning.
+- CSV output: not implemented; use `output.format: "parquet"`.
+- Spark groupBy benchmark: baseline, physical-only, and method-aware modes.
+- Spark join benchmark: baseline, physical-only, and experimental
+  method-aware modes for safe single-key scenarios.
+- Standalone `file_size_balancing` planner strategy: not implemented.
 
 ## Statistics
 
@@ -82,8 +119,10 @@ The planner should:
 3. Assign normal keys by hash or complete load-aware placement.
 4. Split heavy keys across several buckets.
 5. Compute an output partition id for each record.
-6. Try to keep partition sizes below L.
-7. Minimize unnecessary rewriting and excessive partition count.
+6. Estimate before/after skew and target-bound satisfaction.
+7. Choose rewrite or no-op based on heavy keys, partition bounds, imbalance,
+   and rewrite cost.
+8. Minimize unnecessary rewriting and excessive partition count.
 
 ## Main strategy
 
@@ -102,6 +141,35 @@ normal keys is disabled because the planner does not know the full set of
 normal keys. Normal rows then use hash fallback unless they belong to a planned
 heavy key.
 
+## Downstream Execution
+
+Physical rewriting alone can help scan/filter workloads by changing file layout
+and partition directories. It does not by itself rewrite Spark logical
+operators.
+
+For `group_by`, method-aware downstream execution uses two stages:
+
+```text
+partial groupBy: [_rp_partition_id, _rp_salt, key_columns...]
+final groupBy:   [key_columns...]
+```
+
+If technical columns are disabled or missing, method-aware groupBy is degraded
+or skipped by the Spark benchmark rather than silently claiming full salting.
+
+For `join`, the planner can recommend:
+
+- `broadcast_join`;
+- `salted_heavy_key_join`;
+- `heavy_key_isolation_join`;
+- `physical_repartitioning`;
+- `generic_join_repartitioning` when no join plan is available.
+
+The Spark join benchmark implements method-aware join as an experimental
+validation path. It supports single-column join keys and structured heavy-key
+metadata. Composite join keys are not executed silently; the benchmark records
+`skipped = true` with a skip reason.
+
 ## Storage-level output sizing
 
 The implemented method is focused on adaptive partitioning with selective
@@ -113,6 +181,11 @@ an output-layer optimization, not a separate partitioning strategy.
 standalone method that would explicitly split oversized input files and coalesce
 small input files. In the current prototype the planner rejects this strategy
 with a clear error and recommends `adaptive_hash_salt`.
+
+Storage metadata such as `small_file_count`, `oversized_file_count`,
+`target_file_size_mb`, and `min_file_size_mb` describes the file layer. These
+fields should not be interpreted as evidence that standalone input file
+coalescing/splitting has been implemented.
 
 ## Metadata
 

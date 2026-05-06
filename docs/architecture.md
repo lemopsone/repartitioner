@@ -9,6 +9,25 @@ The prototype consists of two parts:
 
 The Rust core is the developed software product. Spark is not part of the core method.
 
+## Applicability
+
+The prototype supports the following scope:
+
+| Area | Status |
+| --- | --- |
+| Adaptive hash/salt repartitioning | Fully implemented in Rust core |
+| No-op decision | Implemented; metadata is written without Parquet rewrite |
+| Parquet input/output | Full prototype support |
+| CSV input | Supported for statistics/planning |
+| CSV output | Not implemented |
+| Spark groupBy benchmark | Baseline, physical-only, method-aware |
+| Spark join benchmark | Baseline, physical-only, experimental method-aware |
+| Standalone file-size balancing strategy | Not implemented; writer file rolling only |
+
+The implemented Rust method should therefore be described as adaptive key
+placement with selective salting and optional no-op, not as a general-purpose
+file compaction engine or a Spark extension.
+
 ## Rust core
 
 Expected crate layout:
@@ -199,7 +218,11 @@ partial aggregation by `["_rp_partition_id", "_rp_salt", ...key_columns]`,
 followed by final aggregation by the original key columns.
 
 For `join`, the plan recommends method-aware salted heavy-key join logic using
-the materialized technical columns `_rp_salt` and `_rp_is_heavy_key`.
+the materialized technical columns `_rp_salt` and `_rp_is_heavy_key`. Join
+metadata can recommend `broadcast_join`, `salted_heavy_key_join`,
+`heavy_key_isolation_join`, or `physical_repartitioning`. The Spark benchmark
+implements these as an experimental validation path for single-column join
+keys; unsupported composite cases are skipped with explicit reasons.
 
 Physical rewriting alone can improve scan/filter locality and file layout, but
 group_by/join skew mitigation requires downstream logic that consumes the

@@ -17,7 +17,7 @@ python3 experiments/generate_multi_heavy_key.py --output data/multi-heavy.parque
 python3 experiments/generate_zipf.py --output data/zipf.parquet --rows 100000 --zipf-exponent 1.2
 ```
 
-Запуск core-метода через Python-обертку с генерацией отчета:
+Запуск Rust-ядра через Python-обертку с генерацией отчета:
 
 ```bash
 python3 experiments/run_preprocessor.py \
@@ -38,7 +38,7 @@ python3 experiments/collect_results.py \
 
 ## Полный набор экспериментов
 
-Единый runner для раздела исследования:
+Единый сценарный runner для раздела исследования:
 
 ```bash
 .venv/bin/python experiments/run_suite.py \
@@ -48,11 +48,12 @@ python3 experiments/collect_results.py \
 
 По умолчанию запускается матрица:
 
-- distributions: `uniform`, `single_heavy`, `multi_heavy`, `zipf`;
-- rows: `10000`, `100000`, `1000000`;
-- heavy_fraction: `0.1`, `0.25`, `0.5`, `0.75`;
-- max_partitions: `4`, `8`, `16`, `32`;
-- target_partition_size_mb: `16`, `64`, `128`.
+- распределения: `uniform_no_skew`, `uniform`, `single_heavy`,
+  `multi_heavy`, `zipf`;
+- количество строк: `10000`, `100000`, `1000000`;
+- доля heavy key: `0.1`, `0.25`, `0.5`, `0.75`;
+- максимум партиций: `4`, `8`, `16`, `32`;
+- целевой размер партиции: `16`, `64`, `128` МБ.
 
 Для быстрой проверки runner-а:
 
@@ -78,25 +79,40 @@ preprocessor:
   --skip-spark
 ```
 
-Runner сохраняет для каждого сценария:
+Сценарный runner сохраняет для каждого сценария:
 
 - сгенерированный dataset и `input.parquet.json`;
 - YAML-конфиг preprocessor-а;
 - JSON-результат preprocessor-а;
-- Spark JSON/CSV benchmark result.
+- JSON/CSV-отчёт Spark benchmark-а.
 
 Итоговые файлы:
 
 - `summary.csv` — таблица для графиков ВКР;
 - `summary.json` — те же результаты плюс список неуспешных сценариев.
 
-В `summary.csv` отдельно фиксируются Spark-only времена и end-to-end времена:
+В `summary.csv` отдельно фиксируются времена только Spark и end-to-end времена:
 
+- `before_max_mean_ratio`;
+- `after_max_mean_ratio`;
+- `skew_reduction_ratio`;
 - `spark_baseline_seconds`;
 - `spark_physical_only_seconds`;
 - `spark_method_aware_seconds`;
 - `end_to_end_physical_only_seconds`;
 - `end_to_end_method_aware_seconds`.
+
+Дополнительно сохраняются:
+
+- `before_max_partition_size`;
+- `after_max_partition_size`;
+- `before_cv`;
+- `after_cv`;
+- `target_rows_satisfied_after`;
+- `heavy_hitter_count`;
+- `output_partitions`;
+- `output_file_count`;
+- `partitioning_strategy`.
 
 Для no-op сценариев method-aware Spark-режим может быть `null`, потому что
 preprocessor не материализует технические колонки и Spark читает исходный input
@@ -107,3 +123,18 @@ preprocessor не материализует технические колонк
 метод не обязан физически переписывать dataset. В таком запуске ожидается
 `rewrite_required=false`, `action=no_op`, а `preprocessing_writing_seconds`
 отражает только запись metadata и должен быть близок к нулю.
+
+## Границы интерпретации
+
+Набор экспериментов оценивает прототип, а не произвольную Spark-интеграцию:
+
+- Rust-ядро не зависит от Spark.
+- Parquet используется как основной формат прототипа.
+- CSV-ввод можно использовать для демонстрации слоя адаптеров, но CSV-вывод
+  отсутствует.
+- `file_size_balancing` как отдельная стратегия не участвует в наборе
+  экспериментов; в отчётах отражается только rolling выходных файлов на уровне
+  writer-а.
+- Method-aware join является экспериментальным режимом Spark benchmark-а и может
+  быть пропущен с `skip_reason`, если metadata или схема не позволяют выполнить
+  его безопасно.
