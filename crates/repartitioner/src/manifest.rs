@@ -327,7 +327,11 @@ mod tests {
                 partition_column: Some("_rp_partition_id".to_string()),
                 salt_column: Some("_rp_salt".to_string()),
                 heavy_key_column: Some("_rp_is_heavy_key".to_string()),
-                partial_group_keys: vec!["_rp_partition_id".to_string(), "user_id".to_string()],
+                partial_group_keys: vec![
+                    "_rp_partition_id".to_string(),
+                    "_rp_salt".to_string(),
+                    "user_id".to_string(),
+                ],
                 final_group_keys: vec!["user_id".to_string()],
                 join_keys: Vec::new(),
                 notes: Vec::new(),

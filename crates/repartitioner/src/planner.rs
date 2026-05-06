@@ -297,13 +297,18 @@ fn recommended_downstream_plan(
                     Vec::new(),
                 )
             }
-            JobType::GroupBy => (
-                "two_stage_group_by",
-                true,
-                partial_group_keys(config),
-                config.partitioning.key_columns.clone(),
-                Vec::new(),
-            ),
+            JobType::GroupBy => {
+                if !config.output.include_technical_columns {
+                    notes.push("method_aware_group_by_requires_technical_columns".to_string());
+                }
+                (
+                    "two_stage_group_by",
+                    true,
+                    partial_group_keys(config),
+                    config.partitioning.key_columns.clone(),
+                    Vec::new(),
+                )
+            }
             JobType::Join => join_recommendation(config, join_plan, &mut notes),
             JobType::Generic => (
                 "physical_repartitioning",
@@ -402,6 +407,7 @@ fn partial_group_keys(config: &Config) -> Vec<String> {
     let mut keys = Vec::new();
     if config.output.include_technical_columns {
         keys.push(config.output.partition_column.clone());
+        keys.push(config.output.salt_column.clone());
     }
     keys.extend(config.partitioning.key_columns.clone());
     keys
@@ -799,9 +805,41 @@ mod tests {
         );
         assert_eq!(
             recommendation.partial_group_keys,
-            vec!["_rp_partition_id".to_string(), "user_id".to_string()]
+            vec![
+                "_rp_partition_id".to_string(),
+                "_rp_salt".to_string(),
+                "user_id".to_string()
+            ]
         );
         assert_eq!(recommendation.final_group_keys, vec!["user_id".to_string()]);
+    }
+
+    #[test]
+    fn group_by_recommendation_contains_salt_column() {
+        let config = config_with_job_type("group_by");
+        let plan = build_plan_for_job_config(&config);
+
+        assert!(plan
+            .metadata
+            .recommended_downstream_plan
+            .partial_group_keys
+            .contains(&"_rp_salt".to_string()));
+    }
+
+    #[test]
+    fn group_by_plan_notes_missing_technical_columns_for_method_aware_mode() {
+        let config = config_with_disabled_technical_columns("group_by");
+        let plan = build_plan_for_job_config(&config);
+        let recommendation = &plan.metadata.recommended_downstream_plan;
+
+        assert_eq!(
+            recommendation.partial_group_keys,
+            vec!["user_id".to_string()]
+        );
+        assert_eq!(recommendation.salt_column, None);
+        assert!(recommendation
+            .notes
+            .contains(&"method_aware_group_by_requires_technical_columns".to_string()));
     }
 
     #[test]
@@ -1048,6 +1086,37 @@ partitioning:
   strategy: "adaptive_hash_salt"
   heavy_key_alpha: 2.0
   seed: 42
+
+job:
+  type: "{job_type}"
+  downstream_engine: "spark"
+
+resources:
+  local_threads: 8
+  memory_limit_mb: 4096
+"#
+        ))
+        .expect("test config should parse")
+    }
+
+    fn config_with_disabled_technical_columns(job_type: &str) -> Config {
+        Config::from_yaml_str(&format!(
+            r#"
+dataset:
+  input: "./data/input.parquet"
+  output: "./data/output_partitioned"
+  format: "parquet"
+
+partitioning:
+  key_columns: ["user_id"]
+  target_partition_size_mb: 128
+  max_partitions: 4
+  strategy: "adaptive_hash_salt"
+  heavy_key_alpha: 2.0
+  seed: 42
+
+output:
+  include_technical_columns: false
 
 job:
   type: "{job_type}"

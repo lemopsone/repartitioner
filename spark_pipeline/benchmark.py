@@ -172,6 +172,14 @@ def run_group_by_benchmark(
     results = [baseline, physical_only]
     if include_method_aware:
         partition_column = resolve_method_aware_partition_column(preprocessed, partition_plan)
+        salt_column = resolve_method_aware_salt_column(preprocessed, partition_plan)
+        partial_group_keys, method_aware_extra = resolve_method_aware_partial_group_keys(
+            preprocessed,
+            partition_plan,
+            key_column=key_column,
+            partition_column=partition_column,
+            salt_column=salt_column,
+        )
         if warmup:
             preprocessed.select(key_column).limit(1).count()
         method_aware = run_method_aware_group_by(
@@ -182,6 +190,9 @@ def run_group_by_benchmark(
             dataset_path=preprocessed_path,
             key_column=key_column,
             partition_column=partition_column,
+            salt_column=salt_column,
+            partial_group_keys=partial_group_keys,
+            method_aware_extra=method_aware_extra,
         )
         method_aware.correctness = correctness_against_baseline(method_aware, baseline)
         results.append(method_aware)
@@ -236,9 +247,18 @@ def run_method_aware_group_by(
     dataset_path: Path,
     key_column: str,
     partition_column: str,
+    salt_column: str | None,
+    partial_group_keys: list[str] | None = None,
+    method_aware_extra: dict | None = None,
 ) -> BenchmarkResult:
+    group_keys = partial_group_keys or default_method_aware_partial_group_keys(
+        key_column=key_column,
+        partition_column=partition_column,
+        salt_column=salt_column,
+    )
+
     def action() -> dict:
-        partial = dataframe.groupBy(partition_column, key_column).count()
+        partial = dataframe.groupBy(*group_keys).count()
         final = partial.groupBy(key_column).agg(F.sum("count").alias("count"))
         row = final.agg(
             F.count(F.lit(1)).alias("result_rows"),
@@ -266,6 +286,9 @@ def run_method_aware_group_by(
         extra={
             "max_group_count": metrics["max_group_count"],
             "partition_column": partition_column,
+            "salt_column": salt_column,
+            "partial_group_keys": group_keys,
+            **(method_aware_extra or {}),
         },
     )
 
@@ -374,6 +397,117 @@ def resolve_method_aware_partition_column(
         "method-aware groupBy requires a materialized partition column; "
         f"checked {candidates}, available columns: {preprocessed.columns}"
     )
+
+
+def resolve_method_aware_salt_column(
+    preprocessed: DataFrame,
+    partition_plan: dict | None,
+) -> str | None:
+    candidates: list[str] = []
+    if partition_plan is not None:
+        recommended = partition_plan.get("recommended_downstream_plan") or {}
+        technical_columns = partition_plan.get("technical_columns") or {}
+        salt_column = technical_columns.get("salt_column")
+        if salt_column:
+            candidates.append(salt_column)
+        for column in recommended.get("partial_group_keys") or []:
+            if column.endswith("_salt") or column in {"_rp_salt", "_ap_salt"}:
+                candidates.append(column)
+
+    candidates.extend(["_rp_salt", "_ap_salt"])
+    for column in unique_preserving_order(candidates):
+        if column in preprocessed.columns:
+            return column
+
+    return None
+
+
+def resolve_method_aware_partial_group_keys(
+    preprocessed: DataFrame,
+    partition_plan: dict | None,
+    *,
+    key_column: str,
+    partition_column: str,
+    salt_column: str | None,
+) -> tuple[list[str], dict]:
+    extra = {
+        "salt_column_used": False,
+        "method_aware_degraded": False,
+        "degraded_reason": None,
+    }
+    available_columns = set(preprocessed.columns)
+    recommended_keys = recommended_partial_group_keys(partition_plan)
+
+    if recommended_keys:
+        missing = [column for column in recommended_keys if column not in available_columns]
+        allowed_missing = {column for column in missing if is_salt_column(column, partition_plan)}
+        unexpected_missing = [column for column in missing if column not in allowed_missing]
+        if unexpected_missing:
+            raise ValueError(
+                "method-aware groupBy partial_group_keys are missing from DataFrame: "
+                f"{unexpected_missing}; available columns: {preprocessed.columns}"
+            )
+
+        partial_keys = [column for column in recommended_keys if column in available_columns]
+        if salt_column is not None and salt_column not in partial_keys:
+            insert_at = 1 if partition_column in partial_keys else 0
+            partial_keys.insert(insert_at, salt_column)
+        if partition_column not in partial_keys:
+            partial_keys.insert(0, partition_column)
+        if key_column not in partial_keys:
+            partial_keys.append(key_column)
+    else:
+        partial_keys = default_method_aware_partial_group_keys(
+            key_column=key_column,
+            partition_column=partition_column,
+            salt_column=salt_column,
+        )
+
+    if salt_column is not None and salt_column in partial_keys:
+        extra["salt_column_used"] = True
+    else:
+        extra["method_aware_degraded"] = True
+        extra["degraded_reason"] = "salt_column_missing"
+
+    return unique_preserving_order(partial_keys), extra
+
+
+def recommended_partial_group_keys(partition_plan: dict | None) -> list[str]:
+    if partition_plan is None:
+        return []
+    recommended = partition_plan.get("recommended_downstream_plan") or {}
+    return list(recommended.get("partial_group_keys") or [])
+
+
+def default_method_aware_partial_group_keys(
+    *,
+    key_column: str,
+    partition_column: str,
+    salt_column: str | None,
+) -> list[str]:
+    partial_keys = [partition_column]
+    if salt_column is not None:
+        partial_keys.append(salt_column)
+    partial_keys.append(key_column)
+    return partial_keys
+
+
+def is_salt_column(column: str, partition_plan: dict | None) -> bool:
+    if partition_plan is not None:
+        salt_column = (partition_plan.get("technical_columns") or {}).get("salt_column")
+        if column == salt_column:
+            return True
+    return column.endswith("_salt") or column in {"_rp_salt", "_ap_salt"}
+
+
+def unique_preserving_order(values: Iterable[str]) -> list[str]:
+    unique: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if value not in seen:
+            unique.append(value)
+            seen.add(value)
+    return unique
 
 
 def write_reports(results: Iterable[BenchmarkResult], json_report: Path, csv_report: Path) -> None:

@@ -24,7 +24,8 @@ python3 spark_pipeline/benchmark.py \
 
 - `baseline`: `original.groupBy(key_column).count()`.
 - `physical_only`: `preprocessed.groupBy(key_column).count()`.
-- `method_aware`: двухстадийная агрегация по технической колонке партиции и ключу.
+- `method_aware`: двухстадийная агрегация по техническим колонкам партиции,
+  salt и исходному ключу.
 
 `method_aware` включается автоматически, если в preprocessed dataset есть
 `_partition_plan.json`. Его также можно запросить явно:
@@ -38,10 +39,17 @@ python3 spark_pipeline/run_groupby.py \
   --include-method-aware
 ```
 
-Для method-aware groupBy колонка партиции берётся из
-`technical_columns.partition_column` в `_partition_plan.json`. Если техническая
-колонка не записана, benchmark пробует Hive-style колонки `rp_partition` и
-`ap_partition`, если Spark видит их при чтении dataset.
+Для method-aware groupBy partial stage использует
+`recommended_downstream_plan.partial_group_keys` из `_partition_plan.json`, если
+они доступны в DataFrame. Обычно это `_rp_partition_id`, `_rp_salt` и исходный
+ключ. Если `_rp_salt` отсутствует, benchmark не падает, но помечает режим как
+degraded через `extra.salt_column_used = false`,
+`extra.method_aware_degraded = true` и
+`extra.degraded_reason = "salt_column_missing"`.
+
+Колонка партиции берётся из `technical_columns.partition_column`. Если
+техническая колонка не записана, benchmark пробует Hive-style колонки
+`rp_partition` и `ap_partition`, если Spark видит их при чтении dataset.
 
 В JSON/CSV отчётах поле `mode` разделяет `baseline`, `physical_only` и
 `method_aware`, а `correctness` показывает совпадение числа строк и числа групп
