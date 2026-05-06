@@ -32,6 +32,9 @@ pub fn write_output(
             assignments,
             dataset,
         ),
+        DatasetFormat::Csv => Err(Error::UnsupportedFormat(
+            "CSV output is not implemented; use parquet output".to_string(),
+        )),
     }
 }
 

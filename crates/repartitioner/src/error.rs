@@ -32,6 +32,9 @@ pub enum Error {
     #[error("Parquet error: {0}")]
     Parquet(#[from] parquet::errors::ParquetError),
 
+    #[error("CSV error: {0}")]
+    Csv(#[from] csv::Error),
+
     #[error("invalid config: {0}")]
     InvalidConfig(#[from] ConfigValidationError),
 

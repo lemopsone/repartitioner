@@ -8,6 +8,7 @@ use crate::{
     Config, Result,
 };
 
+pub mod csv;
 pub mod parquet;
 
 pub trait DatasetReader {

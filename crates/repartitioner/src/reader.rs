@@ -3,7 +3,7 @@ use arrow_array::RecordBatch;
 use crate::{
     config::DatasetFormat,
     dataset::Dataset,
-    io::{parquet::ParquetDatasetReader, DatasetReader},
+    io::{csv::CsvDatasetReader, parquet::ParquetDatasetReader, DatasetReader},
     Config, Result,
 };
 
@@ -37,5 +37,6 @@ impl InputDataset {
 pub fn read_dataset(config: &Config) -> Result<InputDataset> {
     match &config.dataset.format {
         DatasetFormat::Parquet => ParquetDatasetReader.read_dataset(config),
+        DatasetFormat::Csv => CsvDatasetReader.read_dataset(config),
     }
 }

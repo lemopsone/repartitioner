@@ -88,6 +88,7 @@ pub struct DatasetConfig {
 #[serde(rename_all = "snake_case")]
 pub enum DatasetFormat {
     Parquet,
+    Csv,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -354,6 +355,14 @@ resources:
         assert_eq!(config.job.job_type, JobType::GroupBy);
         assert_eq!(config.job.downstream_engine, DownstreamEngine::Spark);
         assert_eq!(config.resources.local_threads, 8);
+    }
+
+    #[test]
+    fn parses_csv_dataset_format() {
+        let config = parse_replacing("format: \"parquet\"", "format: \"csv\"")
+            .expect("csv config should parse");
+
+        assert_eq!(config.dataset.format, DatasetFormat::Csv);
     }
 
     #[test]
