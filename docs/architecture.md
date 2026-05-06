@@ -84,6 +84,26 @@ job:
 resources:
   local_threads: 8
   memory_limit_mb: 4096
+  fail_on_memory_limit: false
+
+## Resource Guard
+
+The current prototype uses in-memory processing for method statistics and row
+assignment. `resources.memory_limit_mb` is therefore used as an explicit guard
+against unexpectedly large inputs.
+
+During statistics computation the tool estimates dataset size from input file
+sizes and writes a `resources` section to `_stats.json`:
+
+- configured memory limit;
+- estimated dataset size in MB;
+- whether in-memory processing is used;
+- whether the configured limit is exceeded;
+- resource warnings.
+
+If `resources.fail_on_memory_limit` is `false`, the tool continues and records a
+warning. If it is `true`, statistics computation fails with
+`ResourceLimitExceeded` before planning and writing.
 
 ## Job-aware planning
 

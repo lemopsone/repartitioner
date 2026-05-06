@@ -3,11 +3,11 @@ use std::collections::BTreeMap;
 use crate::{
     hashing, heavy_hitters,
     manifest::{
-        HeavyKeyPlan, InputFileStats, InputStats, PartitionEstimates, SkewStats, StatsMetadata,
-        METADATA_VERSION,
+        HeavyKeyPlan, InputFileStats, InputStats, PartitionEstimates, ResourceEstimate, SkewStats,
+        StatsMetadata, METADATA_VERSION,
     },
     reader::InputDataset,
-    targeting, Config, Result,
+    targeting, Config, Error, Result,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -22,6 +22,7 @@ impl ComputedStatistics {
 }
 
 pub fn compute_statistics(config: &Config, dataset: &InputDataset) -> Result<ComputedStatistics> {
+    let resources = resource_estimate(config, dataset)?;
     let key_frequencies = key_frequencies(dataset, &config.partitioning.key_columns);
     let mean_key_frequency = mean_frequency(&key_frequencies);
     let max_key_frequency = max_frequency(&key_frequencies);
@@ -74,6 +75,7 @@ pub fn compute_statistics(config: &Config, dataset: &InputDataset) -> Result<Com
             heavy_hitter_candidates,
             heavy_hitters,
         },
+        resources,
         skew,
         estimates: PartitionEstimates {
             target_partitions: target_partitioning.output_partitions,
@@ -83,6 +85,42 @@ pub fn compute_statistics(config: &Config, dataset: &InputDataset) -> Result<Com
     };
 
     Ok(ComputedStatistics { metadata })
+}
+
+fn resource_estimate(config: &Config, dataset: &InputDataset) -> Result<ResourceEstimate> {
+    let estimated_dataset_size_mb = estimated_dataset_size_mb(dataset);
+    let memory_limit_exceeded =
+        estimated_dataset_size_mb.is_some_and(|size_mb| size_mb > config.resources.memory_limit_mb);
+
+    if memory_limit_exceeded && config.resources.fail_on_memory_limit {
+        return Err(Error::ResourceLimitExceeded {
+            configured_memory_limit_mb: config.resources.memory_limit_mb,
+            estimated_dataset_size_mb: estimated_dataset_size_mb.unwrap_or_default(),
+        });
+    }
+
+    let mut warnings = Vec::new();
+    if memory_limit_exceeded {
+        warnings.push("estimated_dataset_size_exceeds_configured_memory_limit".to_string());
+    }
+
+    Ok(ResourceEstimate {
+        configured_memory_limit_mb: config.resources.memory_limit_mb,
+        estimated_dataset_size_mb,
+        in_memory_processing_used: true,
+        memory_limit_exceeded,
+        warnings,
+    })
+}
+
+fn estimated_dataset_size_mb(dataset: &InputDataset) -> Option<u64> {
+    let total_size_bytes = dataset
+        .files
+        .iter()
+        .map(|file| file.size_bytes)
+        .sum::<u64>();
+
+    (total_size_bytes > 0).then_some(total_size_bytes.div_ceil(1024 * 1024))
 }
 
 fn heavy_key_plan_placeholder(heavy: heavy_hitters::HeavyHitter) -> HeavyKeyPlan {
@@ -317,6 +355,70 @@ mod tests {
     }
 
     #[test]
+    fn small_dataset_does_not_exceed_memory_limit() {
+        let config = example_config();
+        let dataset = input_dataset_with_file_size(
+            Dataset::from_key_values("user_id", ["a", "b"]),
+            1024 * 1024,
+        );
+
+        let statistics = compute_statistics(&config, &dataset).expect("statistics should compute");
+
+        assert_eq!(
+            statistics.metadata.resources.configured_memory_limit_mb,
+            4096
+        );
+        assert_eq!(
+            statistics.metadata.resources.estimated_dataset_size_mb,
+            Some(1)
+        );
+        assert!(statistics.metadata.resources.in_memory_processing_used);
+        assert!(!statistics.metadata.resources.memory_limit_exceeded);
+        assert!(statistics.metadata.resources.warnings.is_empty());
+    }
+
+    #[test]
+    fn memory_limit_warning_allows_execution_when_not_strict() {
+        let config = config_with_memory_guard(1, false);
+        let dataset = input_dataset_with_file_size(
+            Dataset::from_key_values("user_id", ["a", "b"]),
+            2 * 1024 * 1024,
+        );
+
+        let statistics = compute_statistics(&config, &dataset).expect("statistics should compute");
+
+        assert_eq!(
+            statistics.metadata.resources.estimated_dataset_size_mb,
+            Some(2)
+        );
+        assert!(statistics.metadata.resources.memory_limit_exceeded);
+        assert_eq!(
+            statistics.metadata.resources.warnings,
+            vec!["estimated_dataset_size_exceeds_configured_memory_limit".to_string()]
+        );
+    }
+
+    #[test]
+    fn strict_memory_limit_returns_error_when_estimate_exceeds_limit() {
+        let config = config_with_memory_guard(1, true);
+        let dataset = input_dataset_with_file_size(
+            Dataset::from_key_values("user_id", ["a", "b"]),
+            2 * 1024 * 1024,
+        );
+
+        let error =
+            compute_statistics(&config, &dataset).expect_err("strict memory guard should fail");
+
+        assert!(matches!(
+            error,
+            Error::ResourceLimitExceeded {
+                configured_memory_limit_mb: 1,
+                estimated_dataset_size_mb: 2,
+            }
+        ));
+    }
+
+    #[test]
     fn small_dataset_uses_adaptive_partition_count_from_size_estimate() {
         let config = example_config();
         let dataset = InputDataset {
@@ -422,5 +524,47 @@ resources:
                 .sum::<u64>(),
             dataset.rows.row_count()
         );
+    }
+
+    fn config_with_memory_guard(memory_limit_mb: u64, fail_on_memory_limit: bool) -> Config {
+        Config::from_yaml_str(&format!(
+            r#"
+dataset:
+  input: "./data/input.parquet"
+  output: "./data/output_partitioned"
+  format: "parquet"
+
+partitioning:
+  key_columns: ["user_id"]
+  target_partition_size_mb: 128
+  max_partitions: 4
+  strategy: "adaptive_hash_salt"
+  heavy_key_alpha: 2.0
+  seed: 42
+
+job:
+  type: "group_by"
+  downstream_engine: "spark"
+
+resources:
+  local_threads: 8
+  memory_limit_mb: {memory_limit_mb}
+  fail_on_memory_limit: {fail_on_memory_limit}
+"#
+        ))
+        .expect("test config should parse")
+    }
+
+    fn input_dataset_with_file_size(rows: Dataset, size_bytes: u64) -> InputDataset {
+        InputDataset {
+            path: "input.parquet".to_string(),
+            format: DatasetFormat::Parquet,
+            files: vec![InputFile {
+                path: "input.parquet".to_string(),
+                size_bytes,
+            }],
+            rows,
+            batches: Vec::new(),
+        }
     }
 }

@@ -114,8 +114,18 @@ pub struct SaltPartitionPlan {
 pub struct StatsMetadata {
     pub version: String,
     pub input: InputStats,
+    pub resources: ResourceEstimate,
     pub skew: SkewStats,
     pub estimates: PartitionEstimates,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceEstimate {
+    pub configured_memory_limit_mb: u64,
+    pub estimated_dataset_size_mb: Option<u64>,
+    pub in_memory_processing_used: bool,
+    pub memory_limit_exceeded: bool,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -301,6 +311,13 @@ mod tests {
                 key_frequencies: BTreeMap::from([("a".to_string(), 5), ("b".to_string(), 5)]),
                 heavy_hitter_candidates: Vec::new(),
                 heavy_hitters: Vec::new(),
+            },
+            resources: ResourceEstimate {
+                configured_memory_limit_mb: 4096,
+                estimated_dataset_size_mb: Some(1),
+                in_memory_processing_used: true,
+                memory_limit_exceeded: false,
+                warnings: Vec::new(),
             },
             skew: SkewStats {
                 max_partition_size: 5,

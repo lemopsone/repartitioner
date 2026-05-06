@@ -52,6 +52,14 @@ pub enum Error {
 
     #[error("unsupported dataset format: {0}")]
     UnsupportedFormat(String),
+
+    #[error(
+        "resource limit exceeded: estimated dataset size {estimated_dataset_size_mb} MB exceeds configured memory limit {configured_memory_limit_mb} MB"
+    )]
+    ResourceLimitExceeded {
+        configured_memory_limit_mb: u64,
+        estimated_dataset_size_mb: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]

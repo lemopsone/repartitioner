@@ -170,6 +170,7 @@ pub enum DownstreamEngine {
 pub struct ResourceConfig {
     pub local_threads: usize,
     pub memory_limit_mb: u64,
+    pub fail_on_memory_limit: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -178,7 +179,7 @@ struct RawConfig {
     partitioning: RawPartitioningConfig,
     output: Option<RawOutputConfig>,
     job: JobConfig,
-    resources: ResourceConfig,
+    resources: RawResourceConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -207,6 +208,13 @@ struct RawOutputConfig {
     partition_column: Option<String>,
     salt_column: Option<String>,
     heavy_key_column: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawResourceConfig {
+    local_threads: usize,
+    memory_limit_mb: u64,
+    fail_on_memory_limit: Option<bool>,
 }
 
 impl TryFrom<RawConfig> for Config {
@@ -282,7 +290,11 @@ impl TryFrom<RawConfig> for Config {
             },
             output,
             job: raw.job,
-            resources: raw.resources,
+            resources: ResourceConfig {
+                local_threads: raw.resources.local_threads,
+                memory_limit_mb: raw.resources.memory_limit_mb,
+                fail_on_memory_limit: raw.resources.fail_on_memory_limit.unwrap_or(false),
+            },
         };
 
         config.validate()?;
@@ -355,6 +367,8 @@ resources:
         assert_eq!(config.job.job_type, JobType::GroupBy);
         assert_eq!(config.job.downstream_engine, DownstreamEngine::Spark);
         assert_eq!(config.resources.local_threads, 8);
+        assert_eq!(config.resources.memory_limit_mb, 4096);
+        assert!(!config.resources.fail_on_memory_limit);
     }
 
     #[test]
@@ -423,6 +437,17 @@ resources:
 
         assert!(config.partitioning.force_rewrite);
         assert_eq!(config.partitioning.no_op_max_imbalance_ratio, 1.5);
+    }
+
+    #[test]
+    fn parses_optional_resource_memory_guard() {
+        let config = parse_replacing(
+            "memory_limit_mb: 4096",
+            "memory_limit_mb: 4096\n  fail_on_memory_limit: true",
+        )
+        .expect("config with memory guard should parse");
+
+        assert!(config.resources.fail_on_memory_limit);
     }
 
     #[test]
