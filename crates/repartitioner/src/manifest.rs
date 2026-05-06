@@ -197,6 +197,9 @@ pub struct TimingMetadata {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourceEstimate {
+    pub configured_local_threads: usize,
+    pub local_threads_used: usize,
+    pub parallel_execution_enabled: bool,
     pub configured_memory_limit_mb: u64,
     pub estimated_dataset_size_mb: Option<u64>,
     pub in_memory_processing_used: bool,
@@ -553,6 +556,9 @@ mod tests {
                 after_partition_sizes: vec![5, 5],
             },
             resources: ResourceEstimate {
+                configured_local_threads: 8,
+                local_threads_used: 8,
+                parallel_execution_enabled: false,
                 configured_memory_limit_mb: 4096,
                 estimated_dataset_size_mb: Some(1),
                 in_memory_processing_used: true,
@@ -621,6 +627,18 @@ mod tests {
         assert!(stats_value["skew"].is_object());
         assert!(stats_value["estimates"].is_object());
         assert!(stats_value["resources"].is_object());
+        assert_eq!(
+            stats_value["resources"]["configured_local_threads"].as_u64(),
+            Some(8)
+        );
+        assert_eq!(
+            stats_value["resources"]["local_threads_used"].as_u64(),
+            Some(8)
+        );
+        assert_eq!(
+            stats_value["resources"]["parallel_execution_enabled"].as_bool(),
+            Some(false)
+        );
         assert_eq!(stats_value["timing"]["read_seconds"].as_f64(), Some(0.1));
         assert_eq!(stats_value["timing"]["total_seconds"].as_f64(), Some(1.5));
         assert!(stats_json.contains("\"total_rows\":10"));

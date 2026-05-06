@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use crate::{
     config::HeavyHitterMode,
     dataset::Row,
+    execution::ExecutionResources,
     hashing, heavy_hitters,
     key_encoding::{key_value_to_string, key_value_type_name},
     manifest::{
@@ -239,24 +240,31 @@ fn mb_to_bytes(value: u64) -> u64 {
 }
 
 fn resource_estimate(config: &Config, dataset: &InputDataset) -> Result<ResourceEstimate> {
+    let execution_resources = ExecutionResources::from_config(config);
     let estimated_dataset_size_mb = estimated_dataset_size_mb(dataset);
-    let memory_limit_exceeded =
-        estimated_dataset_size_mb.is_some_and(|size_mb| size_mb > config.resources.memory_limit_mb);
+    let memory_limit_exceeded = estimated_dataset_size_mb
+        .is_some_and(|size_mb| size_mb > execution_resources.memory_limit_mb);
 
     if memory_limit_exceeded && config.resources.fail_on_memory_limit {
         return Err(Error::ResourceLimitExceeded {
-            configured_memory_limit_mb: config.resources.memory_limit_mb,
+            configured_memory_limit_mb: execution_resources.memory_limit_mb,
             estimated_dataset_size_mb: estimated_dataset_size_mb.unwrap_or_default(),
         });
     }
 
     let mut warnings = Vec::new();
+    if !execution_resources.parallel_execution_enabled && config.resources.local_threads > 1 {
+        warnings.push("local_threads_configured_but_not_used_for_parallel_execution".to_string());
+    }
     if memory_limit_exceeded {
         warnings.push("estimated_dataset_size_exceeds_configured_memory_limit".to_string());
     }
 
     Ok(ResourceEstimate {
-        configured_memory_limit_mb: config.resources.memory_limit_mb,
+        configured_local_threads: config.resources.local_threads,
+        local_threads_used: execution_resources.local_threads,
+        parallel_execution_enabled: execution_resources.parallel_execution_enabled,
+        configured_memory_limit_mb: execution_resources.memory_limit_mb,
         estimated_dataset_size_mb,
         in_memory_processing_used: true,
         memory_limit_exceeded,
@@ -852,13 +860,51 @@ resources:
             statistics.metadata.resources.configured_memory_limit_mb,
             4096
         );
+        assert_eq!(statistics.metadata.resources.configured_local_threads, 8);
+        assert_eq!(statistics.metadata.resources.local_threads_used, 8);
+        assert!(!statistics.metadata.resources.parallel_execution_enabled);
         assert_eq!(
             statistics.metadata.resources.estimated_dataset_size_mb,
             Some(1)
         );
         assert!(statistics.metadata.resources.in_memory_processing_used);
         assert!(!statistics.metadata.resources.memory_limit_exceeded);
-        assert!(statistics.metadata.resources.warnings.is_empty());
+        assert_eq!(
+            statistics.metadata.resources.warnings,
+            vec!["local_threads_configured_but_not_used_for_parallel_execution".to_string()]
+        );
+    }
+
+    #[test]
+    fn resource_metadata_contains_local_threads() {
+        let config = example_config();
+        let dataset = input_dataset_with_file_size(
+            Dataset::from_key_values("user_id", ["a", "b"]),
+            1024 * 1024,
+        );
+
+        let statistics = compute_statistics(&config, &dataset).expect("statistics should compute");
+
+        assert_eq!(statistics.metadata.resources.configured_local_threads, 8);
+        assert_eq!(statistics.metadata.resources.local_threads_used, 8);
+    }
+
+    #[test]
+    fn resource_metadata_reports_parallel_execution_status() {
+        let config = example_config();
+        let dataset = input_dataset_with_file_size(
+            Dataset::from_key_values("user_id", ["a", "b"]),
+            1024 * 1024,
+        );
+
+        let statistics = compute_statistics(&config, &dataset).expect("statistics should compute");
+
+        assert!(!statistics.metadata.resources.parallel_execution_enabled);
+        assert!(statistics
+            .metadata
+            .resources
+            .warnings
+            .contains(&"local_threads_configured_but_not_used_for_parallel_execution".to_string()));
     }
 
     #[test]
@@ -876,10 +922,12 @@ resources:
             Some(2)
         );
         assert!(statistics.metadata.resources.memory_limit_exceeded);
-        assert_eq!(
-            statistics.metadata.resources.warnings,
-            vec!["estimated_dataset_size_exceeds_configured_memory_limit".to_string()]
-        );
+        assert!(statistics
+            .metadata
+            .resources
+            .warnings
+            .contains(&"estimated_dataset_size_exceeds_configured_memory_limit".to_string()));
+        assert_eq!(statistics.metadata.resources.configured_memory_limit_mb, 1);
     }
 
     #[test]

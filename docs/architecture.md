@@ -158,11 +158,21 @@ unexpectedly large inputs.
 During statistics computation the tool estimates dataset size from input file
 sizes and writes a `resources` section to `_stats.json`:
 
+- configured local thread count;
+- local thread count used by the current execution model;
+- whether parallel execution is enabled;
 - configured memory limit;
 - estimated dataset size in MB;
 - whether in-memory processing is used;
 - whether the configured limit is exceeded;
 - resource warnings.
+
+The prototype currently does not use Rayon or a CPU thread pool, so
+`parallel_execution_enabled` is `false`. `resources.local_threads` is still
+applied as a deterministic cap for the number of simultaneously open Parquet
+partition writers in the streaming output path. Metadata records the configured
+value and adds a warning when the value is not used for true parallel
+execution.
 
 If `resources.fail_on_memory_limit` is `false`, the tool continues and records a
 warning. If it is `true`, statistics computation fails with

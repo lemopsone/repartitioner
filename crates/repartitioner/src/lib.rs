@@ -2,6 +2,7 @@ pub mod cli;
 pub mod config;
 pub mod dataset;
 pub mod error;
+pub mod execution;
 pub mod hashing;
 pub mod heavy_hitters;
 pub mod io;

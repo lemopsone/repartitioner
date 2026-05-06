@@ -421,7 +421,7 @@ fn write_streaming_parquet_output(
     assignments: &PartitionAssignmentSummary,
     dataset: &InputDataset,
 ) -> Result<Vec<OutputFile>> {
-    let mut state = StreamingOutputState::default();
+    let mut state = StreamingOutputState::new(stats.resources.local_threads_used);
     let file_sizing = FileSizing::from_stats(stats);
     let scanner = ParquetDatasetReader;
 
@@ -445,11 +445,22 @@ fn write_streaming_parquet_output(
     Ok(state.output_files)
 }
 
-#[derive(Default)]
 struct StreamingOutputState {
+    open_writer_limit: usize,
     open_writers: BTreeMap<usize, OpenPartitionWriter>,
     next_file_indexes: BTreeMap<usize, usize>,
     output_files: Vec<OutputFile>,
+}
+
+impl StreamingOutputState {
+    fn new(open_writer_limit: usize) -> Self {
+        Self {
+            open_writer_limit: open_writer_limit.max(1),
+            open_writers: BTreeMap::new(),
+            next_file_indexes: BTreeMap::new(),
+            output_files: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -540,6 +551,7 @@ fn write_streamed_batch(
             ) {
                 close_partition_writer(output_dir, partition_id, state)?;
             }
+            ensure_open_writer_capacity(output_dir, partition_id, state)?;
 
             let writer = partition_writer(
                 output_dir,
@@ -572,6 +584,25 @@ fn should_roll_partition_writer(
                 .saturating_add(next_batch_size_bytes)
                 > target_file_size_bytes
     })
+}
+
+fn ensure_open_writer_capacity(
+    output_dir: &Path,
+    partition_id: usize,
+    state: &mut StreamingOutputState,
+) -> Result<()> {
+    if state.open_writers.contains_key(&partition_id) {
+        return Ok(());
+    }
+
+    while state.open_writers.len() >= state.open_writer_limit {
+        let Some(partition_to_close) = state.open_writers.keys().copied().next() else {
+            break;
+        };
+        close_partition_writer(output_dir, partition_to_close, state)?;
+    }
+
+    Ok(())
 }
 
 fn close_partition_writer(
