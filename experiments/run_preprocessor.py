@@ -22,6 +22,8 @@ def main() -> None:
     parser.add_argument("--target-partition-size-mb", type=int, default=128)
     parser.add_argument("--max-partitions", type=int, default=16)
     parser.add_argument("--heavy-key-alpha", type=float, default=2.0)
+    parser.add_argument("--heavy-hitter-mode", choices=["exact", "approximate"], default="exact")
+    parser.add_argument("--approximate-capacity", type=int, default=10000)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--force-rewrite",
@@ -49,6 +51,8 @@ def main() -> None:
         target_partition_size_mb=args.target_partition_size_mb,
         max_partitions=args.max_partitions,
         heavy_key_alpha=args.heavy_key_alpha,
+        heavy_hitter_mode=args.heavy_hitter_mode,
+        approximate_capacity=args.approximate_capacity,
         seed=args.seed,
         force_rewrite=args.force_rewrite,
     )
@@ -114,6 +118,8 @@ def write_config(
     max_partitions: int,
     heavy_key_alpha: float,
     seed: int,
+    heavy_hitter_mode: str = "exact",
+    approximate_capacity: int = 10_000,
     force_rewrite: bool = False,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -132,6 +138,10 @@ partitioning:
   heavy_key_alpha: {heavy_key_alpha}
   seed: {seed}
 {force_rewrite_line}
+
+statistics:
+  heavy_hitter_mode: "{heavy_hitter_mode}"
+  approximate_capacity: {approximate_capacity}
 
 job:
   type: "group_by"

@@ -89,6 +89,9 @@ pub enum ConfigValidationError {
     )]
     InvalidNoOpMaxImbalanceRatio { value: f64 },
 
+    #[error("statistics.approximate_capacity must be greater than zero, got {value}")]
+    InvalidApproximateCapacity { value: usize },
+
     #[error("unsupported partitioning.strategy: {value}")]
     InvalidStrategyName { value: String },
 }

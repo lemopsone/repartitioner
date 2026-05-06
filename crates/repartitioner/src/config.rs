@@ -13,6 +13,7 @@ use crate::{error::ConfigValidationError, Error, Result};
 pub struct Config {
     pub dataset: DatasetConfig,
     pub partitioning: PartitioningConfig,
+    pub statistics: StatisticsConfig,
     pub output: OutputConfig,
     pub job: JobConfig,
     pub resources: ResourceConfig,
@@ -104,6 +105,19 @@ pub struct PartitioningConfig {
     pub seed: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StatisticsConfig {
+    pub heavy_hitter_mode: HeavyHitterMode,
+    pub approximate_capacity: NonZeroUsize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HeavyHitterMode {
+    Exact,
+    Approximate,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutputConfig {
     pub include_technical_columns: bool,
@@ -177,6 +191,7 @@ pub struct ResourceConfig {
 struct RawConfig {
     dataset: RawDatasetConfig,
     partitioning: RawPartitioningConfig,
+    statistics: Option<RawStatisticsConfig>,
     output: Option<RawOutputConfig>,
     job: JobConfig,
     resources: RawResourceConfig,
@@ -200,6 +215,12 @@ struct RawPartitioningConfig {
     force_rewrite: Option<bool>,
     no_op_max_imbalance_ratio: Option<f64>,
     seed: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawStatisticsConfig {
+    heavy_hitter_mode: Option<HeavyHitterMode>,
+    approximate_capacity: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -269,6 +290,7 @@ impl TryFrom<RawConfig> for Config {
         }
 
         let strategy = PartitioningStrategy::from_str(raw.partitioning.strategy.as_str())?;
+        let statistics = statistics_config(raw.statistics)?;
         let output = output_config(raw.output);
 
         let config = Config {
@@ -288,6 +310,7 @@ impl TryFrom<RawConfig> for Config {
                 no_op_max_imbalance_ratio,
                 seed: raw.partitioning.seed,
             },
+            statistics,
             output,
             job: raw.job,
             resources: ResourceConfig {
@@ -300,6 +323,23 @@ impl TryFrom<RawConfig> for Config {
         config.validate()?;
         Ok(config)
     }
+}
+
+fn statistics_config(
+    raw: Option<RawStatisticsConfig>,
+) -> std::result::Result<StatisticsConfig, ConfigValidationError> {
+    let raw = raw.unwrap_or(RawStatisticsConfig {
+        heavy_hitter_mode: None,
+        approximate_capacity: None,
+    });
+    let capacity = raw.approximate_capacity.unwrap_or(10_000);
+    let approximate_capacity = NonZeroUsize::new(capacity)
+        .ok_or(ConfigValidationError::InvalidApproximateCapacity { value: capacity })?;
+
+    Ok(StatisticsConfig {
+        heavy_hitter_mode: raw.heavy_hitter_mode.unwrap_or(HeavyHitterMode::Exact),
+        approximate_capacity,
+    })
 }
 
 fn output_config(raw: Option<RawOutputConfig>) -> OutputConfig {
@@ -356,6 +396,8 @@ resources:
         assert_eq!(config.partitioning.max_partitions.get(), 128);
         assert!(!config.partitioning.force_rewrite);
         assert_eq!(config.partitioning.no_op_max_imbalance_ratio, 1.2);
+        assert_eq!(config.statistics.heavy_hitter_mode, HeavyHitterMode::Exact);
+        assert_eq!(config.statistics.approximate_capacity.get(), 10_000);
         assert!(config.output.include_technical_columns);
         assert_eq!(config.output.partition_column, "_rp_partition_id");
         assert_eq!(config.output.salt_column, "_rp_salt");
@@ -451,6 +493,20 @@ resources:
     }
 
     #[test]
+    fn parses_optional_statistics_config() {
+        let config = Config::from_yaml_str(&format!(
+            "{EXAMPLE_CONFIG}\nstatistics:\n  heavy_hitter_mode: \"approximate\"\n  approximate_capacity: 512\n"
+        ))
+        .expect("config with statistics controls should parse");
+
+        assert_eq!(
+            config.statistics.heavy_hitter_mode,
+            HeavyHitterMode::Approximate
+        );
+        assert_eq!(config.statistics.approximate_capacity.get(), 512);
+    }
+
+    #[test]
     fn parses_optional_output_config() {
         let config = Config::from_yaml_str(&format!(
             "{EXAMPLE_CONFIG}\noutput:\n  include_technical_columns: false\n  partition_column: \"partition_id\"\n  salt_column: \"salt\"\n  heavy_key_column: \"is_heavy\"\n"
@@ -499,6 +555,18 @@ resources:
         assert_validation_error(
             error,
             ConfigValidationError::InvalidNoOpMaxImbalanceRatio { value: 0.0 },
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_approximate_capacity() {
+        let error = Config::from_yaml_str(&format!(
+            "{EXAMPLE_CONFIG}\nstatistics:\n  heavy_hitter_mode: \"approximate\"\n  approximate_capacity: 0\n"
+        ))
+        .expect_err("zero approximate capacity should be rejected");
+        assert_validation_error(
+            error,
+            ConfigValidationError::InvalidApproximateCapacity { value: 0 },
         );
     }
 

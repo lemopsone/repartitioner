@@ -1,10 +1,11 @@
 use std::collections::BTreeMap;
 
 use crate::{
+    config::HeavyHitterMode,
     hashing, heavy_hitters,
     manifest::{
-        HeavyKeyPlan, InputFileStats, InputStats, PartitionEstimates, ResourceEstimate, SkewStats,
-        StatsMetadata, TimingMetadata, METADATA_VERSION,
+        HeavyHitterDetectionMetadata, HeavyKeyPlan, InputFileStats, InputStats, PartitionEstimates,
+        ResourceEstimate, SkewStats, StatsMetadata, TimingMetadata, METADATA_VERSION,
     },
     reader::InputDataset,
     targeting, Config, Error, Result,
@@ -27,7 +28,8 @@ impl ComputedStatistics {
 
 pub fn compute_statistics(config: &Config, dataset: &InputDataset) -> Result<ComputedStatistics> {
     let resources = resource_estimate(config, dataset)?;
-    let key_frequencies = key_frequencies(dataset, &config.partitioning.key_columns);
+    let key_frequency_summary = key_frequency_summary(dataset, config);
+    let key_frequencies = key_frequency_summary.frequencies;
     let mean_key_frequency = mean_frequency(&key_frequencies);
     let max_key_frequency = max_frequency(&key_frequencies);
     let estimated_row_width_bytes = estimated_row_width_bytes(dataset);
@@ -79,6 +81,7 @@ pub fn compute_statistics(config: &Config, dataset: &InputDataset) -> Result<Com
             heavy_hitter_candidates,
             heavy_hitters,
         },
+        heavy_hitter_detection: key_frequency_summary.detection_metadata,
         skew,
         estimates: PartitionEstimates {
             target_partitions: target_partitioning.output_partitions,
@@ -90,6 +93,12 @@ pub fn compute_statistics(config: &Config, dataset: &InputDataset) -> Result<Com
     };
 
     Ok(ComputedStatistics { metadata })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KeyFrequencySummary {
+    frequencies: BTreeMap<String, u64>,
+    detection_metadata: HeavyHitterDetectionMetadata,
 }
 
 fn resource_estimate(config: &Config, dataset: &InputDataset) -> Result<ResourceEstimate> {
@@ -154,6 +163,37 @@ fn estimated_row_width_bytes(dataset: &InputDataset) -> Option<u64> {
     }
 
     Some(total_size_bytes.div_ceil(total_rows).max(1))
+}
+
+fn key_frequency_summary(dataset: &InputDataset, config: &Config) -> KeyFrequencySummary {
+    match config.statistics.heavy_hitter_mode {
+        HeavyHitterMode::Exact => KeyFrequencySummary {
+            frequencies: key_frequencies(dataset, &config.partitioning.key_columns),
+            detection_metadata: HeavyHitterDetectionMetadata {
+                mode: "exact".to_string(),
+                capacity: config.statistics.approximate_capacity.get(),
+                error_bound: "0".to_string(),
+            },
+        },
+        HeavyHitterMode::Approximate => {
+            let summary = heavy_hitters::space_saving(
+                dataset
+                    .rows
+                    .rows
+                    .iter()
+                    .filter_map(|row| row.partition_key(&config.partitioning.key_columns)),
+                config.statistics.approximate_capacity.get(),
+            );
+            KeyFrequencySummary {
+                frequencies: summary.frequencies,
+                detection_metadata: HeavyHitterDetectionMetadata {
+                    mode: "approximate".to_string(),
+                    capacity: config.statistics.approximate_capacity.get(),
+                    error_bound: format!("space_saving_max_overestimate={}", summary.max_error),
+                },
+            }
+        }
+    }
 }
 
 fn key_frequencies(dataset: &InputDataset, key_columns: &[String]) -> BTreeMap<String, u64> {
@@ -319,6 +359,64 @@ mod tests {
             statistics.metadata.input.heavy_hitters[0].estimated_frequency,
             5
         );
+    }
+
+    #[test]
+    fn approximate_heavy_hitter_mode_detects_synthetic_heavy_key() {
+        let config = Config::from_yaml_str(
+            r#"
+dataset:
+  input: "./data/input.parquet"
+  output: "./data/output_partitioned"
+  format: "parquet"
+
+partitioning:
+  key_columns: ["user_id"]
+  target_partition_size_mb: 128
+  max_partitions: 4
+  strategy: "adaptive_hash_salt"
+  heavy_key_alpha: 2.0
+  seed: 42
+
+statistics:
+  heavy_hitter_mode: "approximate"
+  approximate_capacity: 32
+
+job:
+  type: "group_by"
+  downstream_engine: "spark"
+
+resources:
+  local_threads: 8
+  memory_limit_mb: 4096
+"#,
+        )
+        .expect("config should parse");
+        let dataset = InputDataset::from_rows(Dataset::from_key_values(
+            "user_id",
+            std::iter::repeat_n("heavy".to_string(), 200)
+                .chain((0..800).map(|index| format!("key_{index}"))),
+        ));
+
+        let statistics = compute_statistics(&config, &dataset).expect("statistics should compute");
+
+        assert_eq!(
+            statistics.metadata.heavy_hitter_detection.mode,
+            "approximate"
+        );
+        assert_eq!(statistics.metadata.heavy_hitter_detection.capacity, 32);
+        assert!(statistics
+            .metadata
+            .heavy_hitter_detection
+            .error_bound
+            .starts_with("space_saving_max_overestimate="));
+        assert!(statistics
+            .metadata
+            .input
+            .heavy_hitters
+            .iter()
+            .any(|heavy| heavy.key == "7:user_id#utf8:5:heavy"));
+        assert!(statistics.metadata.input.key_frequencies.len() <= 32);
     }
 
     #[test]

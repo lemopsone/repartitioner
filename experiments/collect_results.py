@@ -87,6 +87,7 @@ def collect_results(
         "action": partition_plan.get("action"),
         "skip_reason": partition_plan.get("skip_reason"),
         "cost_estimate": partition_plan.get("cost_estimate"),
+        "heavy_hitter_detection": stats.get("heavy_hitter_detection"),
         "resources": stats.get("resources"),
         "output_file_count": len(manifest.get("output_files", [])),
         "before": partition_summary(before_sizes),

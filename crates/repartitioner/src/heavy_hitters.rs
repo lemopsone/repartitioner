@@ -9,6 +9,62 @@ pub struct HeavyHitter {
     pub detection_reasons: Vec<HeavyKeyReason>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpaceSavingSummary {
+    pub frequencies: BTreeMap<String, u64>,
+    pub max_error: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SpaceSavingCounter {
+    count: u64,
+    error: u64,
+}
+
+pub fn space_saving<I>(keys: I, capacity: usize) -> SpaceSavingSummary
+where
+    I: IntoIterator<Item = String>,
+{
+    let capacity = capacity.max(1);
+    let mut counters = BTreeMap::<String, SpaceSavingCounter>::new();
+    let mut max_error = 0;
+
+    for key in keys {
+        if let Some(counter) = counters.get_mut(&key) {
+            counter.count += 1;
+            continue;
+        }
+
+        if counters.len() < capacity {
+            counters.insert(key, SpaceSavingCounter { count: 1, error: 0 });
+            continue;
+        }
+
+        let (min_key, min_counter) = counters
+            .iter()
+            .min_by_key(|(candidate_key, counter)| (counter.count, *candidate_key))
+            .map(|(candidate_key, counter)| (candidate_key.clone(), *counter))
+            .expect("space-saving counters should not be empty");
+        counters.remove(&min_key);
+        max_error = max_error.max(min_counter.count);
+        counters.insert(
+            key,
+            SpaceSavingCounter {
+                count: min_counter.count + 1,
+                error: min_counter.count,
+            },
+        );
+    }
+
+    SpaceSavingSummary {
+        frequencies: counters
+            .into_iter()
+            .map(|(key, counter)| (key, counter.count))
+            .collect(),
+        max_error,
+    }
+}
+
 pub fn detect_heavy_hitter_candidates(
     key_frequencies: &BTreeMap<String, u64>,
     alpha: f64,
@@ -119,5 +175,17 @@ mod tests {
         assert!(hitters.iter().all(
             |heavy| heavy.detection_reasons == vec![HeavyKeyReason::ExceedsTargetPartitionRows]
         ));
+    }
+
+    #[test]
+    fn space_saving_keeps_synthetic_heavy_key_with_small_capacity() {
+        let keys = std::iter::repeat_n("heavy".to_string(), 100)
+            .chain((0..900).map(|index| format!("key_{index}")));
+
+        let summary = space_saving(keys, 16);
+
+        assert!(summary.frequencies.contains_key("heavy"));
+        assert!(summary.frequencies["heavy"] >= 100);
+        assert!(summary.max_error > 0);
     }
 }

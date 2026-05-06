@@ -29,6 +29,8 @@ SUMMARY_COLUMNS = [
     "max_partitions",
     "target_partition_size_mb",
     "heavy_key_alpha",
+    "heavy_hitter_mode",
+    "approximate_capacity",
     "rewrite_required",
     "preprocessing_writing_seconds",
     "preprocessing_total_seconds",
@@ -102,6 +104,8 @@ def main() -> None:
     )
     parser.add_argument("--zipf-exponent", type=float, default=DEFAULT_ZIPF_EXPONENT)
     parser.add_argument("--heavy-key-alpha", type=float, default=DEFAULT_HEAVY_KEY_ALPHA)
+    parser.add_argument("--heavy-hitter-mode", choices=["exact", "approximate"], default="exact")
+    parser.add_argument("--approximate-capacity", type=int, default=10000)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--key-cardinality", type=int, default=10_000)
     parser.add_argument("--shuffle-partitions", type=int, default=200)
@@ -253,6 +257,10 @@ def run_preprocessor(
         str(case.max_partitions),
         "--heavy-key-alpha",
         str(case.heavy_key_alpha),
+        "--heavy-hitter-mode",
+        args.heavy_hitter_mode,
+        "--approximate-capacity",
+        str(args.approximate_capacity),
         "--seed",
         str(case.seed),
         "--input-metadata",
@@ -320,6 +328,8 @@ def build_summary_row(
         "max_partitions": case.max_partitions,
         "target_partition_size_mb": case.target_partition_size_mb,
         "heavy_key_alpha": case.heavy_key_alpha,
+        "heavy_hitter_mode": args_heavy_hitter_mode(preprocessor_result),
+        "approximate_capacity": args_approximate_capacity(preprocessor_result),
         "rewrite_required": preprocessor_result.get("rewrite_required"),
         "preprocessing_writing_seconds": preprocessor_result.get("preprocessing_writing_seconds"),
         "preprocessing_total_seconds": preprocessing_total,
@@ -349,6 +359,16 @@ def spark_results_by_mode(spark_result: dict[str, Any] | None) -> dict[str, dict
         for result in spark_result.get("results", [])
         if result.get("workload") == "group_by"
     }
+
+
+def args_heavy_hitter_mode(preprocessor_result: dict[str, Any]) -> str | None:
+    detection = preprocessor_result.get("heavy_hitter_detection") or {}
+    return detection.get("mode")
+
+
+def args_approximate_capacity(preprocessor_result: dict[str, Any]) -> int | None:
+    detection = preprocessor_result.get("heavy_hitter_detection") or {}
+    return detection.get("capacity")
 
 
 def validate_method_aware_correctness(spark_result: dict[str, Any]) -> None:

@@ -114,10 +114,18 @@ pub struct SaltPartitionPlan {
 pub struct StatsMetadata {
     pub version: String,
     pub input: InputStats,
+    pub heavy_hitter_detection: HeavyHitterDetectionMetadata,
     pub skew: SkewStats,
     pub estimates: PartitionEstimates,
     pub resources: ResourceEstimate,
     pub timing: Option<TimingMetadata>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeavyHitterDetectionMetadata {
+    pub mode: String,
+    pub capacity: usize,
+    pub error_bound: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -330,6 +338,11 @@ mod tests {
                 heavy_hitter_candidates: Vec::new(),
                 heavy_hitters: Vec::new(),
             },
+            heavy_hitter_detection: HeavyHitterDetectionMetadata {
+                mode: "exact".to_string(),
+                capacity: 10_000,
+                error_bound: "0".to_string(),
+            },
             skew: SkewStats {
                 max_partition_size: 5,
                 mean_partition_size: 5.0,
@@ -388,6 +401,10 @@ mod tests {
 
         assert_eq!(stats_value["version"].as_str(), Some("0.2.0"));
         assert!(stats_value["input"].is_object());
+        assert_eq!(
+            stats_value["heavy_hitter_detection"]["mode"].as_str(),
+            Some("exact")
+        );
         assert!(stats_value["skew"].is_object());
         assert!(stats_value["estimates"].is_object());
         assert!(stats_value["resources"].is_object());
