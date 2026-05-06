@@ -30,7 +30,7 @@ src/
 
 Example command:
 
-adaptive-partitioner \
+repartitioner \
   --input ./data/input.parquet \
   --output ./data/output_partitioned \
   --config ./configs/heavy-key.yaml

@@ -7,7 +7,7 @@ use crate::{
     hashing, heavy_hitters,
     manifest::{
         CostEstimate, HeavyKeyPlan, NormalKeyPlan, PartitionPlan, PartitionPlanFeasibility,
-        PlanAction, SaltPartitionPlan, METADATA_VERSION,
+        PlanAction, SaltPartitionPlan, TechnicalColumns, METADATA_VERSION,
     },
     statistics::ComputedStatistics,
     targeting, Config, Result,
@@ -116,6 +116,12 @@ pub fn build_plan(config: &Config, statistics: &ComputedStatistics) -> Result<Pl
             action: rewrite_decision.action,
             skip_reason: rewrite_decision.skip_reason,
             cost_estimate,
+            technical_columns: TechnicalColumns {
+                included: config.output.include_technical_columns,
+                partition_column: config.output.partition_column.clone(),
+                salt_column: config.output.salt_column.clone(),
+                heavy_key_column: config.output.heavy_key_column.clone(),
+            },
             normal_keys,
             heavy_keys,
             hash_function: hashing::HASH_FUNCTION_NAME.to_string(),

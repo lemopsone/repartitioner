@@ -13,6 +13,7 @@ use crate::{error::ConfigValidationError, Error, Result};
 pub struct Config {
     pub dataset: DatasetConfig,
     pub partitioning: PartitioningConfig,
+    pub output: OutputConfig,
     pub job: JobConfig,
     pub resources: ResourceConfig,
 }
@@ -103,6 +104,25 @@ pub struct PartitioningConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputConfig {
+    pub include_technical_columns: bool,
+    pub partition_column: String,
+    pub salt_column: String,
+    pub heavy_key_column: String,
+}
+
+impl Default for OutputConfig {
+    fn default() -> Self {
+        Self {
+            include_technical_columns: true,
+            partition_column: "_rp_partition_id".to_string(),
+            salt_column: "_rp_salt".to_string(),
+            heavy_key_column: "_rp_is_heavy_key".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PartitioningStrategy {
     AdaptiveHashSalt,
@@ -155,6 +175,7 @@ pub struct ResourceConfig {
 struct RawConfig {
     dataset: RawDatasetConfig,
     partitioning: RawPartitioningConfig,
+    output: Option<RawOutputConfig>,
     job: JobConfig,
     resources: ResourceConfig,
 }
@@ -177,6 +198,14 @@ struct RawPartitioningConfig {
     force_rewrite: Option<bool>,
     no_op_max_imbalance_ratio: Option<f64>,
     seed: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawOutputConfig {
+    include_technical_columns: Option<bool>,
+    partition_column: Option<String>,
+    salt_column: Option<String>,
+    heavy_key_column: Option<String>,
 }
 
 impl TryFrom<RawConfig> for Config {
@@ -231,6 +260,7 @@ impl TryFrom<RawConfig> for Config {
         }
 
         let strategy = PartitioningStrategy::from_str(raw.partitioning.strategy.as_str())?;
+        let output = output_config(raw.output);
 
         let config = Config {
             dataset: DatasetConfig {
@@ -249,12 +279,28 @@ impl TryFrom<RawConfig> for Config {
                 no_op_max_imbalance_ratio,
                 seed: raw.partitioning.seed,
             },
+            output,
             job: raw.job,
             resources: raw.resources,
         };
 
         config.validate()?;
         Ok(config)
+    }
+}
+
+fn output_config(raw: Option<RawOutputConfig>) -> OutputConfig {
+    let defaults = OutputConfig::default();
+    match raw {
+        Some(raw) => OutputConfig {
+            include_technical_columns: raw
+                .include_technical_columns
+                .unwrap_or(defaults.include_technical_columns),
+            partition_column: raw.partition_column.unwrap_or(defaults.partition_column),
+            salt_column: raw.salt_column.unwrap_or(defaults.salt_column),
+            heavy_key_column: raw.heavy_key_column.unwrap_or(defaults.heavy_key_column),
+        },
+        None => defaults,
     }
 }
 
@@ -297,6 +343,10 @@ resources:
         assert_eq!(config.partitioning.max_partitions.get(), 128);
         assert!(!config.partitioning.force_rewrite);
         assert_eq!(config.partitioning.no_op_max_imbalance_ratio, 1.2);
+        assert!(config.output.include_technical_columns);
+        assert_eq!(config.output.partition_column, "_rp_partition_id");
+        assert_eq!(config.output.salt_column, "_rp_salt");
+        assert_eq!(config.output.heavy_key_column, "_rp_is_heavy_key");
         assert_eq!(
             config.partitioning.strategy,
             PartitioningStrategy::AdaptiveHashSalt
@@ -364,6 +414,19 @@ resources:
 
         assert!(config.partitioning.force_rewrite);
         assert_eq!(config.partitioning.no_op_max_imbalance_ratio, 1.5);
+    }
+
+    #[test]
+    fn parses_optional_output_config() {
+        let config = Config::from_yaml_str(&format!(
+            "{EXAMPLE_CONFIG}\noutput:\n  include_technical_columns: false\n  partition_column: \"partition_id\"\n  salt_column: \"salt\"\n  heavy_key_column: \"is_heavy\"\n"
+        ))
+        .expect("config with output controls should parse");
+
+        assert!(!config.output.include_technical_columns);
+        assert_eq!(config.output.partition_column, "partition_id");
+        assert_eq!(config.output.salt_column, "salt");
+        assert_eq!(config.output.heavy_key_column, "is_heavy");
     }
 
     #[test]

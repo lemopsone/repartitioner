@@ -1,6 +1,8 @@
 use std::{fs::File, path::Path, sync::Arc};
 
-use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
+use arrow_array::{
+    Array, ArrayRef, BooleanArray, Int64Array, RecordBatch, StringArray, UInt32Array,
+};
 use arrow_schema::{DataType, Field, Schema};
 use parquet::arrow::ArrowWriter;
 use repartitioner::{
@@ -60,6 +62,7 @@ fn writes_partitioned_parquet_dataset_and_reads_it_back() -> Result<()> {
         &stats.metadata,
         &assignments,
         &dataset,
+        &config.output,
     )?;
 
     assert!(output.join("_partition_plan.json").is_file());
@@ -77,8 +80,52 @@ fn writes_partitioned_parquet_dataset_and_reads_it_back() -> Result<()> {
 
     assert_eq!(read_back.rows.row_count(), dataset.rows.row_count());
     assert_output_schema_contains_payload_columns(&output, &write_summary.manifest.output_files);
+    assert_output_contains_technical_columns(&output, &write_summary.manifest.output_files);
     assert_plan_metadata_contains_adaptive_partitioning(&output);
     assert_stats_metadata_contains_after_partition_sizes(&output);
+
+    Ok(())
+}
+
+#[test]
+fn omits_technical_columns_when_disabled() -> Result<()> {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let input = tempdir.path().join("input.parquet");
+    let output = tempdir.path().join("partitioned_without_technical_columns");
+    let values = std::iter::repeat_n("heavy", 24)
+        .chain(["a", "b", "c", "d", "e", "f", "g", "h"])
+        .collect::<Vec<_>>();
+    write_user_id_with_payload_parquet(&input, &values)?;
+
+    let config = config_for_without_technical_columns(&input, &output);
+    let dataset = reader::read_dataset(&config)?;
+    let mut stats = statistics::compute_statistics(&config, &dataset)?;
+    let plan = planner::build_plan(&config, &stats)?;
+    let assignments = partitioner::assign_partitions(&plan, &dataset)?;
+    stats.set_after_partition_sizes(assignments.partition_row_counts.clone());
+    let write_summary = writer::write_output(
+        &output,
+        &plan.metadata,
+        &stats.metadata,
+        &assignments,
+        &dataset,
+        &config.output,
+    )?;
+
+    let first_batch = read_first_output_batch(&output, &write_summary.manifest.output_files);
+
+    assert!(first_batch.schema().field_with_name("user_id").is_ok());
+    assert!(first_batch.schema().field_with_name("row_id").is_ok());
+    assert!(first_batch.schema().field_with_name("region").is_ok());
+    assert!(first_batch
+        .schema()
+        .field_with_name("_rp_partition_id")
+        .is_err());
+    assert!(first_batch.schema().field_with_name("_rp_salt").is_err());
+    assert!(first_batch
+        .schema()
+        .field_with_name("_rp_is_heavy_key")
+        .is_err());
 
     Ok(())
 }
@@ -146,6 +193,39 @@ resources:
     .expect("test config should be valid")
 }
 
+fn config_for_without_technical_columns(input: &Path, output: &Path) -> Config {
+    Config::from_yaml_str(&format!(
+        r#"
+dataset:
+  input: "{}"
+  output: "{}"
+  format: "parquet"
+
+partitioning:
+  key_columns: ["user_id"]
+  target_partition_size_mb: 128
+  max_partitions: 4
+  strategy: "adaptive_hash_salt"
+  heavy_key_alpha: 2.0
+  seed: 42
+
+output:
+  include_technical_columns: false
+
+job:
+  type: "group_by"
+  downstream_engine: "spark"
+
+resources:
+  local_threads: 2
+  memory_limit_mb: 1024
+"#,
+        input.display(),
+        output.display()
+    ))
+    .expect("test config should be valid")
+}
+
 fn write_user_id_parquet(path: &Path, values: &[&str]) -> Result<()> {
     let schema = Arc::new(Schema::new(vec![Field::new(
         "user_id",
@@ -198,19 +278,97 @@ fn assert_output_schema_contains_payload_columns(
     output: &Path,
     output_files: &[repartitioner::manifest::OutputFile],
 ) {
-    let first_file = output.join(&output_files.first().expect("at least one output file").path);
-    let file = File::open(first_file).expect("output parquet should open");
-    let builder = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
-        .expect("output parquet reader should build");
-    let mut reader = builder.build().expect("output parquet reader should build");
-    let batch = reader
-        .next()
-        .expect("output parquet should contain a batch")
-        .expect("output parquet batch should read");
+    let batch = read_first_output_batch(output, output_files);
 
     assert_eq!(batch.schema().field(0).name(), "user_id");
     assert!(batch.schema().field_with_name("row_id").is_ok());
     assert!(batch.schema().field_with_name("region").is_ok());
+}
+
+fn assert_output_contains_technical_columns(
+    output: &Path,
+    output_files: &[repartitioner::manifest::OutputFile],
+) {
+    let mut saw_heavy = false;
+    let mut saw_normal = false;
+
+    for output_file in output_files {
+        for batch in read_output_batches(output, output_file) {
+            assert!(batch.schema().field_with_name("_rp_partition_id").is_ok());
+            assert!(batch.schema().field_with_name("_rp_salt").is_ok());
+            assert!(batch.schema().field_with_name("_rp_is_heavy_key").is_ok());
+
+            let user_ids = batch
+                .column_by_name("user_id")
+                .expect("user_id column should exist")
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("user_id should be utf8");
+            let partition_ids = batch
+                .column_by_name("_rp_partition_id")
+                .expect("partition id column should exist")
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .expect("partition id should be UInt32");
+            let salts = batch
+                .column_by_name("_rp_salt")
+                .expect("salt column should exist")
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .expect("salt should be UInt32");
+            let is_heavy_key = batch
+                .column_by_name("_rp_is_heavy_key")
+                .expect("heavy key column should exist")
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .expect("heavy key flag should be boolean");
+
+            for row_index in 0..batch.num_rows() {
+                assert_eq!(
+                    partition_ids.value(row_index) as usize,
+                    output_file.partition_id
+                );
+
+                if user_ids.value(row_index) == "heavy" {
+                    saw_heavy = true;
+                    assert!(!salts.is_null(row_index));
+                    assert!(is_heavy_key.value(row_index));
+                } else {
+                    saw_normal = true;
+                    assert!(salts.is_null(row_index));
+                    assert!(!is_heavy_key.value(row_index));
+                }
+            }
+        }
+    }
+
+    assert!(saw_heavy);
+    assert!(saw_normal);
+}
+
+fn read_first_output_batch(
+    output: &Path,
+    output_files: &[repartitioner::manifest::OutputFile],
+) -> RecordBatch {
+    let first_file = output_files.first().expect("at least one output file");
+    read_output_batches(output, first_file)
+        .into_iter()
+        .next()
+        .expect("output parquet should contain a batch")
+}
+
+fn read_output_batches(
+    output: &Path,
+    output_file: &repartitioner::manifest::OutputFile,
+) -> Vec<RecordBatch> {
+    let file = File::open(output.join(&output_file.path)).expect("output parquet should open");
+    let builder = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+        .expect("output parquet reader should build");
+    let reader = builder.build().expect("output parquet reader should build");
+
+    reader
+        .map(|batch| batch.expect("output parquet batch should read"))
+        .collect()
 }
 
 fn assert_stats_metadata_contains_after_partition_sizes(output: &Path) {
@@ -251,6 +409,22 @@ fn assert_plan_metadata_contains_adaptive_partitioning(output: &Path) {
     assert!(metadata["required_partitions_by_size"].as_u64().is_some());
     assert!(metadata["output_partitions"].as_u64().unwrap_or_default() <= 4);
     assert!(metadata["feasibility"].is_object());
+    assert_eq!(
+        metadata["technical_columns"]["included"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        metadata["technical_columns"]["partition_column"].as_str(),
+        Some("_rp_partition_id")
+    );
+    assert_eq!(
+        metadata["technical_columns"]["salt_column"].as_str(),
+        Some("_rp_salt")
+    );
+    assert_eq!(
+        metadata["technical_columns"]["heavy_key_column"].as_str(),
+        Some("_rp_is_heavy_key")
+    );
 }
 
 fn contains_parquet_file(dir: &Path) -> bool {

@@ -1,16 +1,17 @@
 use std::{fs, fs::File, path::Path, sync::Arc};
 
-use arrow_array::{ArrayRef, RecordBatch, StringArray, UInt32Array};
+use arrow_array::{ArrayRef, BooleanArray, RecordBatch, StringArray, UInt32Array};
 use arrow_schema::{DataType, Field, Schema};
 use arrow_select::take::take;
 use parquet::arrow::ArrowWriter;
 
 use crate::{
+    config::OutputConfig,
     manifest::{
         write_json_metadata, Manifest, OutputFile, PartitionManifest, PartitionPlan, StatsMetadata,
         METADATA_VERSION,
     },
-    partitioner::PartitionAssignmentSummary,
+    partitioner::{PartitionAssignmentSummary, RecordPartitionAssignment},
     reader::InputDataset,
     Error, Result,
 };
@@ -26,6 +27,7 @@ pub fn write_output(
     stats: &StatsMetadata,
     assignments: &PartitionAssignmentSummary,
     dataset: &InputDataset,
+    output_config: &OutputConfig,
 ) -> Result<WriteSummary> {
     let output_dir = output_dir.as_ref();
     fs::create_dir_all(output_dir).map_err(|source| Error::WriteFile {
@@ -33,20 +35,20 @@ pub fn write_output(
         source,
     })?;
 
-    let mut rows_by_partition = vec![Vec::new(); plan.output_partitions];
+    let mut assignments_by_partition = vec![Vec::new(); plan.output_partitions];
     for record in &assignments.records {
-        if record.partition_id < rows_by_partition.len() {
-            rows_by_partition[record.partition_id].push(record.row_index);
+        if record.partition_id < assignments_by_partition.len() {
+            assignments_by_partition[record.partition_id].push(record.clone());
         }
     }
 
     let mut output_files = Vec::new();
-    for (partition_id, row_indexes) in rows_by_partition.iter().enumerate() {
-        if row_indexes.is_empty() {
+    for (partition_id, partition_assignments) in assignments_by_partition.iter().enumerate() {
+        if partition_assignments.is_empty() {
             continue;
         }
 
-        let relative_path = format!("ap_partition={partition_id}/part-{partition_id:05}.parquet");
+        let relative_path = format!("rp_partition={partition_id}/part-{partition_id:05}.parquet");
         let file_path = output_dir.join(&relative_path);
         if let Some(parent) = file_path.parent() {
             fs::create_dir_all(parent).map_err(|source| Error::WriteFile {
@@ -55,12 +57,18 @@ pub fn write_output(
             })?;
         }
 
-        write_partition_parquet(&file_path, plan, dataset, row_indexes)?;
+        write_partition_parquet(
+            &file_path,
+            plan,
+            dataset,
+            partition_assignments,
+            output_config,
+        )?;
         let size_bytes = fs::metadata(&file_path).ok().map(|metadata| metadata.len());
         output_files.push(OutputFile {
             path: relative_path,
             partition_id,
-            row_count: row_indexes.len() as u64,
+            row_count: partition_assignments.len() as u64,
             size_bytes,
         });
     }
@@ -153,10 +161,11 @@ fn write_partition_parquet(
     file_path: &Path,
     plan: &PartitionPlan,
     dataset: &InputDataset,
-    row_indexes: &[usize],
+    assignments: &[RecordPartitionAssignment],
+    output_config: &OutputConfig,
 ) -> Result<()> {
     if !dataset.batches.is_empty() {
-        return write_retained_rows_parquet(file_path, dataset, row_indexes);
+        return write_retained_rows_parquet(file_path, dataset, assignments, output_config);
     }
 
     let schema = Arc::new(Schema::new(
@@ -169,13 +178,13 @@ fn write_partition_parquet(
         .key_columns
         .iter()
         .map(|column| {
-            let values = row_indexes
+            let values = assignments
                 .iter()
-                .map(|row_index| {
+                .map(|assignment| {
                     dataset
                         .rows
                         .rows
-                        .get(*row_index)
+                        .get(assignment.row_index)
                         .and_then(|row| row.key_values().get(column))
                         .cloned()
                 })
@@ -183,12 +192,13 @@ fn write_partition_parquet(
             Arc::new(StringArray::from(values)) as ArrayRef
         })
         .collect::<Vec<_>>();
-    let batch = RecordBatch::try_new(schema.clone(), columns)?;
+    let batch = RecordBatch::try_new(schema, columns)?;
+    let batch = append_technical_columns(batch, assignments, output_config)?;
     let file = File::create(file_path).map_err(|source| Error::WriteFile {
         path: file_path.to_path_buf(),
         source,
     })?;
-    let mut writer = ArrowWriter::try_new(file, schema, None)?;
+    let mut writer = ArrowWriter::try_new(file, batch.schema(), None)?;
     writer.write(&batch)?;
     writer.close()?;
 
@@ -198,16 +208,21 @@ fn write_partition_parquet(
 fn write_retained_rows_parquet(
     file_path: &Path,
     dataset: &InputDataset,
-    row_indexes: &[usize],
+    assignments: &[RecordPartitionAssignment],
+    output_config: &OutputConfig,
 ) -> Result<()> {
-    let schema = dataset.batches[0].schema();
+    let batches = retained_partition_batches(dataset, assignments, output_config)?;
+    let schema = batches
+        .first()
+        .map(|batch| batch.schema())
+        .unwrap_or_else(|| dataset.batches[0].schema());
     let file = File::create(file_path).map_err(|source| Error::WriteFile {
         path: file_path.to_path_buf(),
         source,
     })?;
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), None)?;
+    let mut writer = ArrowWriter::try_new(file, schema, None)?;
 
-    for batch in retained_partition_batches(dataset, row_indexes)? {
+    for batch in batches {
         writer.write(&batch)?;
     }
     writer.close()?;
@@ -217,7 +232,8 @@ fn write_retained_rows_parquet(
 
 fn retained_partition_batches(
     dataset: &InputDataset,
-    row_indexes: &[usize],
+    assignments: &[RecordPartitionAssignment],
+    output_config: &OutputConfig,
 ) -> Result<Vec<RecordBatch>> {
     let mut result = Vec::new();
     let mut batch_start = 0_usize;
@@ -225,28 +241,35 @@ fn retained_partition_batches(
 
     for batch in &dataset.batches {
         let batch_end = batch_start + batch.num_rows();
-        if row_cursor < row_indexes.len() && row_indexes[row_cursor] < batch_start {
+        if row_cursor < assignments.len() && assignments[row_cursor].row_index < batch_start {
             return Err(Error::MissingRetainedRow {
-                row_index: row_indexes[row_cursor],
+                row_index: assignments[row_cursor].row_index,
             });
         }
 
         let mut local_indexes = Vec::new();
-        while row_cursor < row_indexes.len() && row_indexes[row_cursor] < batch_end {
-            local_indexes.push((row_indexes[row_cursor] - batch_start) as u32);
+        let mut local_assignments = Vec::new();
+        while row_cursor < assignments.len() && assignments[row_cursor].row_index < batch_end {
+            local_indexes.push((assignments[row_cursor].row_index - batch_start) as u32);
+            local_assignments.push(assignments[row_cursor].clone());
             row_cursor += 1;
         }
 
         if !local_indexes.is_empty() {
-            result.push(take_batch(batch, &local_indexes)?);
+            let batch = take_batch(batch, &local_indexes)?;
+            result.push(append_technical_columns(
+                batch,
+                &local_assignments,
+                output_config,
+            )?);
         }
 
         batch_start = batch_end;
     }
 
-    if let Some(row_index) = row_indexes.get(row_cursor) {
+    if let Some(assignment) = assignments.get(row_cursor) {
         return Err(Error::MissingRetainedRow {
-            row_index: *row_index,
+            row_index: assignment.row_index,
         });
     }
 
@@ -262,4 +285,59 @@ fn take_batch(batch: &RecordBatch, local_indexes: &[u32]) -> Result<RecordBatch>
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
     Ok(RecordBatch::try_new(batch.schema(), columns)?)
+}
+
+fn append_technical_columns(
+    batch: RecordBatch,
+    local_assignments: &[RecordPartitionAssignment],
+    output_config: &OutputConfig,
+) -> Result<RecordBatch> {
+    if !output_config.include_technical_columns {
+        return Ok(batch);
+    }
+
+    let partition_ids = local_assignments
+        .iter()
+        .map(|assignment| assignment.partition_id as u32)
+        .collect::<Vec<_>>();
+    let salts = local_assignments
+        .iter()
+        .map(|assignment| assignment.salt_index.map(|salt_index| salt_index as u32))
+        .collect::<Vec<_>>();
+    let is_heavy_key = local_assignments
+        .iter()
+        .map(|assignment| assignment.salt_index.is_some())
+        .collect::<Vec<_>>();
+
+    let mut fields = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| field.as_ref().clone())
+        .collect::<Vec<_>>();
+    fields.push(Field::new(
+        &output_config.partition_column,
+        DataType::UInt32,
+        false,
+    ));
+    fields.push(Field::new(
+        &output_config.salt_column,
+        DataType::UInt32,
+        true,
+    ));
+    fields.push(Field::new(
+        &output_config.heavy_key_column,
+        DataType::Boolean,
+        false,
+    ));
+
+    let mut columns = batch.columns().to_vec();
+    columns.push(Arc::new(UInt32Array::from(partition_ids)) as ArrayRef);
+    columns.push(Arc::new(UInt32Array::from(salts)) as ArrayRef);
+    columns.push(Arc::new(BooleanArray::from(is_heavy_key)) as ArrayRef);
+
+    Ok(RecordBatch::try_new(
+        Arc::new(Schema::new(fields)),
+        columns,
+    )?)
 }

@@ -23,6 +23,7 @@ pub struct PartitionPlan {
     pub action: PlanAction,
     pub skip_reason: Option<String>,
     pub cost_estimate: CostEstimate,
+    pub technical_columns: TechnicalColumns,
     pub normal_keys: Vec<NormalKeyPlan>,
     pub heavy_keys: Vec<HeavyKeyPlan>,
     pub hash_function: String,
@@ -50,6 +51,14 @@ pub struct CostEstimate {
     pub estimated_bytes_written: Option<u64>,
     pub rewrite_required: bool,
     pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TechnicalColumns {
+    pub included: bool,
+    pub partition_column: String,
+    pub salt_column: String,
+    pub heavy_key_column: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -196,6 +205,12 @@ mod tests {
                 rewrite_required: true,
                 reason: "heavy_keys_detected".to_string(),
             },
+            technical_columns: TechnicalColumns {
+                included: true,
+                partition_column: "_rp_partition_id".to_string(),
+                salt_column: "_rp_salt".to_string(),
+                heavy_key_column: "_rp_is_heavy_key".to_string(),
+            },
             normal_keys: vec![NormalKeyPlan {
                 key: "user_id=7".to_string(),
                 estimated_frequency: 10,
@@ -271,7 +286,7 @@ mod tests {
             input_reused: false,
             dataset_location: None,
             output_files: vec![OutputFile {
-                path: "ap_partition=0/part-00000.parquet".to_string(),
+                path: "rp_partition=0/part-00000.parquet".to_string(),
                 partition_id: 0,
                 row_count: 5,
                 size_bytes: Some(1024),
@@ -289,6 +304,6 @@ mod tests {
 
         assert!(stats_json.contains("\"total_rows\":10"));
         assert!(stats_json.contains("\"coefficient_of_variation\":0.0"));
-        assert!(manifest_json.contains("\"ap_partition=0/part-00000.parquet\""));
+        assert!(manifest_json.contains("\"rp_partition=0/part-00000.parquet\""));
     }
 }

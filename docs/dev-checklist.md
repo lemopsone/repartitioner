@@ -1,6 +1,6 @@
 # Dev checklist
 
-## AP-00. Baseline текущей реализации
+## RP-00. Baseline текущей реализации
 
 Цель раздела - зафиксировать минимальный набор проверок и карту текущего
 pipeline перед дальнейшими изменениями. Этот документ не описывает новую
@@ -25,7 +25,7 @@ read_dataset
 - `compute_statistics`: считает частоты ключей, кандидатов в heavy hitters и
   базовые метрики перекоса.
 - `build_plan`: строит план адаптивного hash/salt-разбиения.
-- `assign_partitions`: назначает каждой записи выходную `ap_partition`.
+- `assign_partitions`: назначает каждой записи выходную `rp_partition`.
 - `write_output`: записывает Spark-compatible Parquet dataset и JSON-метаданные.
 
 ## Базовые команды проверки
@@ -61,12 +61,11 @@ python -m compileall experiments spark_pipeline datasets
 .venv/bin/python -m compileall experiments spark_pipeline datasets
 ```
 
-## Baseline AP-00
+## Baseline RP-00
 
-На момент фиксации AP-00 выполнены проверки:
+На момент фиксации RP-00 выполнены проверки:
 
 - `cargo fmt --check` - проходит.
 - `cargo test` - проходит.
 - `cargo build -p repartitioner` - проходит.
 - `.venv/bin/python -m compileall experiments spark_pipeline datasets` - проходит.
-

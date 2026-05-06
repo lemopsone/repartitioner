@@ -6,7 +6,7 @@ use crate::{config::Config, Result};
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "adaptive-partitioner",
+    name = "repartitioner",
     version,
     about = "External preprocessing tool for adaptive Parquet repartitioning"
 )]
