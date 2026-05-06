@@ -39,7 +39,6 @@ fn run(args: CliArgs) -> Result<()> {
         &statistics.metadata,
         &assignments,
         &dataset,
-        &config.output,
     )?;
 
     Ok(())

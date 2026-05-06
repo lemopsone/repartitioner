@@ -17,6 +17,8 @@ src/
 - main.rs
 - cli.rs
 - config.rs
+- io/mod.rs
+- io/parquet.rs
 - reader.rs
 - statistics.rs
 - heavy_hitters.rs
@@ -25,6 +27,31 @@ src/
 - writer.rs
 - manifest.rs
 - error.rs
+
+## I/O adapter layer
+
+The adaptive partitioning method is format-independent. The Rust prototype uses
+Parquet as its first concrete dataset format, but Parquet is an implementation
+adapter rather than a constraint of the method.
+
+The crate exposes format-agnostic `DatasetReader` and `DatasetWriter` traits in
+`io/mod.rs`. `reader.rs` and `writer.rs` are facade modules: they select the
+adapter from `dataset.format` and keep the CLI behavior stable.
+
+The current adapter is `io/parquet.rs`. It owns all Arrow/Parquet-specific
+logic: file discovery, Parquet batch reading, Arrow key extraction, retained
+batch rewriting, Hive-style `rp_partition=<id>` output directories, and Parquet
+file writing.
+
+The method core remains outside the adapter layer:
+
+- `statistics.rs`: computes statistics over `InputDataset`.
+- `planner.rs`: builds the partitioning plan.
+- `partitioner.rs`: assigns rows to planned partitions.
+
+Additional formats such as CSV, ORC, or Avro should be added as new adapters
+implementing the same traits, without changing the statistics/planner/
+partitioner logic.
 
 ## CLI
 

@@ -160,7 +160,6 @@ fn writes_partitioned_parquet_dataset_and_reads_it_back() -> Result<()> {
         &stats.metadata,
         &assignments,
         &dataset,
-        &config.output,
     )?;
 
     assert!(output.join("_partition_plan.json").is_file());
@@ -207,7 +206,6 @@ fn omits_technical_columns_when_disabled() -> Result<()> {
         &stats.metadata,
         &assignments,
         &dataset,
-        &config.output,
     )?;
 
     let first_batch = read_first_output_batch(&output, &write_summary.manifest.output_files);
