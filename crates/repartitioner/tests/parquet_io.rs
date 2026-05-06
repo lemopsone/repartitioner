@@ -170,6 +170,10 @@ fn writes_partitioned_parquet_dataset_and_reads_it_back() -> Result<()> {
     assert!(output.join("_stats.json").is_file());
     assert!(output.join("_manifest.json").is_file());
     assert!(!write_summary.manifest.output_files.is_empty());
+    assert_eq!(
+        write_summary.manifest.dataset_location.as_deref(),
+        Some(output.to_string_lossy().as_ref())
+    );
     assert!(write_summary
         .manifest
         .output_files
@@ -184,6 +188,7 @@ fn writes_partitioned_parquet_dataset_and_reads_it_back() -> Result<()> {
     assert_output_contains_technical_columns(&output, &write_summary.manifest.output_files);
     assert_plan_metadata_contains_adaptive_partitioning(&output);
     assert_stats_metadata_contains_after_partition_sizes(&output);
+    assert_metadata_versions_are_current(&output);
 
     Ok(())
 }
@@ -621,6 +626,16 @@ fn assert_stats_metadata_contains_after_partition_sizes(output: &Path) {
             .sum::<u64>()
             > 0
     );
+}
+
+fn assert_metadata_versions_are_current(output: &Path) {
+    for metadata_file in ["_partition_plan.json", "_stats.json", "_manifest.json"] {
+        let payload = std::fs::read_to_string(output.join(metadata_file))
+            .expect("metadata should be readable");
+        let metadata: serde_json::Value =
+            serde_json::from_str(&payload).expect("metadata should parse");
+        assert_eq!(metadata["version"].as_str(), Some("0.2.0"));
+    }
 }
 
 fn assert_plan_metadata_contains_adaptive_partitioning(output: &Path) {

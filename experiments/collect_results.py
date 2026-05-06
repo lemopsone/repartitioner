@@ -37,34 +37,50 @@ def collect_results(
     stats = read_json(output_dataset / "_stats.json")
     manifest = read_json(output_dataset / "_manifest.json")
     input_metadata = read_json(input_metadata_path) if input_metadata_path else None
-    before_sizes = stats["estimates"]["before_partition_sizes"]
+    stats_input = stats.get("input", {})
+    stats_estimates = stats.get("estimates", {})
+    partition_plan_version = partition_plan.get("version")
+    stats_version = stats.get("version")
+    manifest_version = manifest.get("version")
+    before_sizes = stats_estimates.get("before_partition_sizes", [])
     input_reused = bool(manifest.get("input_reused", False))
-    after_sizes = [partition["row_count"] for partition in manifest["partitions"]]
+    manifest_partitions = manifest.get("partitions", [])
+    after_sizes = [partition.get("row_count", 0) for partition in manifest_partitions]
     if input_reused and not after_sizes:
         after_sizes = before_sizes
 
     result = {
+        "metadata_versions": {
+            "partition_plan": partition_plan_version,
+            "stats": stats_version,
+            "manifest": manifest_version,
+        },
         "input": input_metadata,
         "output_dataset": str(output_dataset),
         "input_reused": input_reused,
         "dataset_location": manifest.get("dataset_location"),
         "elapsed_seconds": elapsed_seconds,
-        "rows": stats["input"]["total_rows"],
-        "distinct_keys": stats["input"]["distinct_keys"],
-        "mean_key_frequency": stats["input"]["mean_key_frequency"],
-        "max_key_frequency": stats["input"]["max_key_frequency"],
-        "heavy_hitter_count": len(stats["input"]["heavy_hitters"]),
-        "output_partitions": partition_plan["output_partitions"],
-        "target_partition_rows": partition_plan["target_partition_rows"],
+        "rows": stats_input.get("total_rows"),
+        "distinct_keys": stats_input.get("distinct_keys"),
+        "mean_key_frequency": stats_input.get("mean_key_frequency"),
+        "max_key_frequency": stats_input.get("max_key_frequency"),
+        "heavy_hitter_count": len(stats_input.get("heavy_hitters", [])),
+        "output_partitions": partition_plan.get("output_partitions"),
+        "target_partition_rows": partition_plan.get("target_partition_rows"),
         "job_type": partition_plan.get("job_type"),
         "downstream_engine": partition_plan.get("downstream_engine"),
+        "min_partitions": partition_plan.get("min_partitions"),
+        "max_partitions": partition_plan.get("max_partitions"),
+        "required_partitions_by_size": partition_plan.get("required_partitions_by_size"),
+        "feasibility": partition_plan.get("feasibility"),
         "technical_columns": partition_plan.get("technical_columns"),
         "recommended_downstream_plan": partition_plan.get("recommended_downstream_plan"),
         "rewrite_required": partition_plan.get("rewrite_required"),
         "action": partition_plan.get("action"),
         "skip_reason": partition_plan.get("skip_reason"),
         "cost_estimate": partition_plan.get("cost_estimate"),
-        "output_file_count": len(manifest["output_files"]),
+        "resources": stats.get("resources"),
+        "output_file_count": len(manifest.get("output_files", [])),
         "before": partition_summary(before_sizes),
         "after": partition_summary(after_sizes),
         "partition_plan_path": str(output_dataset / "_partition_plan.json"),

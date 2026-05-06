@@ -75,13 +75,13 @@ pub fn compute_statistics(config: &Config, dataset: &InputDataset) -> Result<Com
             heavy_hitter_candidates,
             heavy_hitters,
         },
-        resources,
         skew,
         estimates: PartitionEstimates {
             target_partitions: target_partitioning.output_partitions,
             before_partition_sizes: partition_sizes,
             after_partition_sizes: vec![0; target_partitioning.output_partitions],
         },
+        resources,
     };
 
     Ok(ComputedStatistics { metadata })

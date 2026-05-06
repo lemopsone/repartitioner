@@ -7,31 +7,31 @@ use crate::{
     Error, Result,
 };
 
-pub const METADATA_VERSION: &str = "0.1.0";
+pub const METADATA_VERSION: &str = "0.2.0";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PartitionPlan {
     pub version: String,
     pub created_at: String,
     pub strategy: PartitioningStrategy,
+    pub action: PlanAction,
+    pub rewrite_required: bool,
     pub key_columns: Vec<String>,
     pub job_type: JobType,
     pub downstream_engine: DownstreamEngine,
-    pub recommended_downstream_plan: RecommendedDownstreamPlan,
+    pub target_partition_size_mb: u64,
+    pub target_partition_rows: u64,
     pub min_partitions: usize,
     pub max_partitions: usize,
-    pub target_partition_size_mb: u64,
-    pub required_partitions_by_size: usize,
-    pub target_partition_rows: u64,
     pub output_partitions: usize,
+    pub required_partitions_by_size: usize,
     pub feasibility: PartitionPlanFeasibility,
-    pub rewrite_required: bool,
-    pub action: PlanAction,
-    pub skip_reason: Option<String>,
-    pub cost_estimate: CostEstimate,
     pub technical_columns: TechnicalColumns,
     pub normal_keys: Vec<NormalKeyPlan>,
     pub heavy_keys: Vec<HeavyKeyPlan>,
+    pub recommended_downstream_plan: RecommendedDownstreamPlan,
+    pub cost_estimate: CostEstimate,
+    pub skip_reason: Option<String>,
     pub hash_function: String,
     pub seed: u64,
 }
@@ -114,9 +114,9 @@ pub struct SaltPartitionPlan {
 pub struct StatsMetadata {
     pub version: String,
     pub input: InputStats,
-    pub resources: ResourceEstimate,
     pub skew: SkewStats,
     pub estimates: PartitionEstimates,
+    pub resources: ResourceEstimate,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -213,41 +213,20 @@ mod tests {
             version: METADATA_VERSION.to_string(),
             created_at: "2026-05-02T00:00:00Z".to_string(),
             strategy: PartitioningStrategy::AdaptiveHashSalt,
+            action: PlanAction::Rewrite,
+            rewrite_required: true,
             key_columns: vec!["user_id".to_string()],
             job_type: JobType::GroupBy,
             downstream_engine: DownstreamEngine::Spark,
-            recommended_downstream_plan: RecommendedDownstreamPlan {
-                job_type: JobType::GroupBy,
-                strategy: "two_stage_group_by".to_string(),
-                requires_operator_rewrite: true,
-                partition_column: Some("_rp_partition_id".to_string()),
-                salt_column: Some("_rp_salt".to_string()),
-                heavy_key_column: Some("_rp_is_heavy_key".to_string()),
-                partial_group_keys: vec!["_rp_partition_id".to_string(), "user_id".to_string()],
-                final_group_keys: vec!["user_id".to_string()],
-                join_keys: Vec::new(),
-                notes: Vec::new(),
-            },
+            target_partition_size_mb: 128,
+            target_partition_rows: 250,
             min_partitions: 1,
             max_partitions: 4,
-            target_partition_size_mb: 128,
-            required_partitions_by_size: 4,
-            target_partition_rows: 250,
             output_partitions: 4,
+            required_partitions_by_size: 4,
             feasibility: PartitionPlanFeasibility {
                 target_partition_size_satisfied: true,
                 reason: None,
-            },
-            rewrite_required: true,
-            action: PlanAction::Rewrite,
-            skip_reason: None,
-            cost_estimate: CostEstimate {
-                estimated_rows_read: 10,
-                estimated_rows_written: 10,
-                estimated_bytes_read: Some(2048),
-                estimated_bytes_written: Some(2048),
-                rewrite_required: true,
-                reason: "heavy_keys_detected".to_string(),
             },
             technical_columns: TechnicalColumns {
                 included: true,
@@ -280,11 +259,39 @@ mod tests {
                     },
                 ],
             }],
+            recommended_downstream_plan: RecommendedDownstreamPlan {
+                job_type: JobType::GroupBy,
+                strategy: "two_stage_group_by".to_string(),
+                requires_operator_rewrite: true,
+                partition_column: Some("_rp_partition_id".to_string()),
+                salt_column: Some("_rp_salt".to_string()),
+                heavy_key_column: Some("_rp_is_heavy_key".to_string()),
+                partial_group_keys: vec!["_rp_partition_id".to_string(), "user_id".to_string()],
+                final_group_keys: vec!["user_id".to_string()],
+                join_keys: Vec::new(),
+                notes: Vec::new(),
+            },
+            cost_estimate: CostEstimate {
+                estimated_rows_read: 10,
+                estimated_rows_written: 10,
+                estimated_bytes_read: Some(2048),
+                estimated_bytes_written: Some(2048),
+                rewrite_required: true,
+                reason: "heavy_keys_detected".to_string(),
+            },
+            skip_reason: None,
             hash_function: "fnv1a64_seeded".to_string(),
             seed: 42,
         };
 
         let json = serde_json::to_string(&plan).expect("plan should serialize");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("plan should parse");
+
+        assert_eq!(value["version"].as_str(), Some("0.2.0"));
+        assert_eq!(value["action"].as_str(), Some("rewrite"));
+        assert_eq!(value["rewrite_required"].as_bool(), Some(true));
+        assert_eq!(value["hash_function"].as_str(), Some("fnv1a64_seeded"));
+        assert!(value["cost_estimate"].is_object());
         assert!(json.contains("\"strategy\":\"adaptive_hash_salt\""));
         assert!(json.contains("\"normal_keys\""));
         assert!(json.contains("\"salt_count\":3"));
@@ -312,13 +319,6 @@ mod tests {
                 heavy_hitter_candidates: Vec::new(),
                 heavy_hitters: Vec::new(),
             },
-            resources: ResourceEstimate {
-                configured_memory_limit_mb: 4096,
-                estimated_dataset_size_mb: Some(1),
-                in_memory_processing_used: true,
-                memory_limit_exceeded: false,
-                warnings: Vec::new(),
-            },
             skew: SkewStats {
                 max_partition_size: 5,
                 mean_partition_size: 5.0,
@@ -333,12 +333,19 @@ mod tests {
                 before_partition_sizes: vec![5, 5],
                 after_partition_sizes: vec![5, 5],
             },
+            resources: ResourceEstimate {
+                configured_memory_limit_mb: 4096,
+                estimated_dataset_size_mb: Some(1),
+                in_memory_processing_used: true,
+                memory_limit_exceeded: false,
+                warnings: Vec::new(),
+            },
         };
 
         let manifest = Manifest {
             version: METADATA_VERSION.to_string(),
             input_reused: false,
-            dataset_location: None,
+            dataset_location: Some("output_dataset".to_string()),
             output_files: vec![OutputFile {
                 path: "rp_partition=0/part-00000.parquet".to_string(),
                 partition_id: 0,
@@ -355,9 +362,23 @@ mod tests {
 
         let stats_json = serde_json::to_string(&stats).expect("stats should serialize");
         let manifest_json = serde_json::to_string(&manifest).expect("manifest should serialize");
+        let stats_value: serde_json::Value =
+            serde_json::from_str(&stats_json).expect("stats should parse");
+        let manifest_value: serde_json::Value =
+            serde_json::from_str(&manifest_json).expect("manifest should parse");
 
+        assert_eq!(stats_value["version"].as_str(), Some("0.2.0"));
+        assert!(stats_value["input"].is_object());
+        assert!(stats_value["skew"].is_object());
+        assert!(stats_value["estimates"].is_object());
+        assert!(stats_value["resources"].is_object());
         assert!(stats_json.contains("\"total_rows\":10"));
         assert!(stats_json.contains("\"coefficient_of_variation\":0.0"));
+        assert_eq!(manifest_value["version"].as_str(), Some("0.2.0"));
+        assert_eq!(
+            manifest_value["dataset_location"].as_str(),
+            Some("output_dataset")
+        );
         assert!(manifest_json.contains("\"rp_partition=0/part-00000.parquet\""));
     }
 }

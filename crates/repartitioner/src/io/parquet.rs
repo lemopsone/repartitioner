@@ -359,7 +359,11 @@ fn write_parquet_output(
         write_retained_parquet_output(output_dir, plan, assignments, dataset)?
     };
 
-    let manifest = manifest_from_output_files(assignments, output_files);
+    let manifest = manifest_from_output_files(
+        assignments,
+        Some(output_dir.display().to_string()),
+        output_files,
+    );
 
     write_metadata_files(output_dir, plan, stats, &manifest)?;
 
@@ -551,6 +555,7 @@ fn partition_writer<'a>(
 
 fn manifest_from_output_files(
     assignments: &PartitionAssignmentSummary,
+    dataset_location: Option<String>,
     output_files: Vec<OutputFile>,
 ) -> Manifest {
     let partitions = assignments
@@ -579,7 +584,7 @@ fn manifest_from_output_files(
     Manifest {
         version: METADATA_VERSION.to_string(),
         input_reused: false,
-        dataset_location: None,
+        dataset_location,
         output_files,
         partitions,
     }
