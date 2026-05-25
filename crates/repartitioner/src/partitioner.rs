@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, thread};
 
 use crate::{hashing, planner::Plan, reader::InputDataset, Result};
 
@@ -17,6 +17,46 @@ pub struct RecordPartitionAssignment {
 }
 
 pub fn assign_partitions(
+    plan: &Plan,
+    dataset: &InputDataset,
+) -> Result<PartitionAssignmentSummary> {
+    assign_partitions_with_threads(plan, dataset, 1)
+}
+
+pub fn assign_partitions_with_threads(
+    plan: &Plan,
+    dataset: &InputDataset,
+    local_threads: usize,
+) -> Result<PartitionAssignmentSummary> {
+    let thread_count = local_threads.max(1).min(dataset.rows.rows.len().max(1));
+    if thread_count == 1 || dataset.rows.rows.len() < 8_192 {
+        return assign_partitions_sequential(plan, dataset);
+    }
+
+    let chunk_size = dataset.rows.rows.len().div_ceil(thread_count);
+    let ranges = chunk_ranges(dataset.rows.rows.len(), chunk_size);
+    let heavy_partitions = heavy_partition_lookup(plan);
+    if heavy_partitions.is_empty() {
+        return assign_partition_chunks(plan, dataset, &heavy_partitions, &ranges, None);
+    }
+
+    let heavy_counts_by_chunk = count_heavy_keys_by_chunk(
+        dataset,
+        &plan.metadata.key_columns,
+        &heavy_partitions,
+        &ranges,
+    );
+    let heavy_offsets_by_chunk = heavy_offsets_by_chunk(&heavy_counts_by_chunk);
+    assign_partition_chunks(
+        plan,
+        dataset,
+        &heavy_partitions,
+        &ranges,
+        Some(&heavy_offsets_by_chunk),
+    )
+}
+
+fn assign_partitions_sequential(
     plan: &Plan,
     dataset: &InputDataset,
 ) -> Result<PartitionAssignmentSummary> {
@@ -86,6 +126,187 @@ pub fn assign_partitions(
     })
 }
 
+fn assign_partition_chunks(
+    plan: &Plan,
+    dataset: &InputDataset,
+    heavy_partitions: &BTreeMap<&str, BTreeMap<usize, usize>>,
+    ranges: &[(usize, usize)],
+    heavy_offsets_by_chunk: Option<&[BTreeMap<String, usize>]>,
+) -> Result<PartitionAssignmentSummary> {
+    let normal_partitions = normal_partition_lookup(plan);
+    let chunks = thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(ranges.len());
+        for (chunk_index, (start, end)) in ranges.iter().copied().enumerate() {
+            let heavy_offsets = heavy_offsets_by_chunk
+                .and_then(|offsets| offsets.get(chunk_index))
+                .cloned()
+                .unwrap_or_default();
+            handles.push(scope.spawn({
+                let normal_partitions = &normal_partitions;
+                let key_columns = &plan.metadata.key_columns;
+                let output_partitions = plan.metadata.output_partitions;
+                let seed = plan.metadata.seed;
+                move || {
+                    assign_partition_chunk(
+                        &dataset.rows.rows[start..end],
+                        start,
+                        key_columns,
+                        output_partitions,
+                        seed,
+                        normal_partitions,
+                        heavy_partitions,
+                        heavy_offsets,
+                    )
+                }
+            }));
+        }
+
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("partition assignment worker panicked"))
+            .collect::<Vec<_>>()
+    });
+
+    let mut partition_row_counts = vec![0; plan.metadata.output_partitions];
+    let mut records = Vec::with_capacity(dataset.rows.rows.len());
+    for chunk in chunks {
+        for (partition_id, row_count) in chunk.partition_row_counts.into_iter().enumerate() {
+            if let Some(total) = partition_row_counts.get_mut(partition_id) {
+                *total += row_count;
+            }
+        }
+        records.extend(chunk.records);
+    }
+
+    Ok(PartitionAssignmentSummary {
+        partition_row_counts,
+        records,
+    })
+}
+
+#[derive(Debug)]
+struct ChunkAssignment {
+    partition_row_counts: Vec<u64>,
+    records: Vec<RecordPartitionAssignment>,
+}
+
+fn assign_partition_chunk(
+    rows: &[crate::dataset::Row],
+    start_index: usize,
+    key_columns: &[String],
+    output_partitions: usize,
+    seed: u64,
+    normal_partitions: &BTreeMap<&str, usize>,
+    heavy_partitions: &BTreeMap<&str, BTreeMap<usize, usize>>,
+    mut heavy_occurrences: BTreeMap<String, usize>,
+) -> ChunkAssignment {
+    let mut partition_row_counts = vec![0; output_partitions];
+    let mut records = Vec::with_capacity(rows.len());
+
+    for (local_index, row) in rows.iter().enumerate() {
+        let row_index = start_index + local_index;
+        let key = row.partition_key(key_columns);
+        let (partition_id, salt_index) = match key.as_deref() {
+            Some(key) => match heavy_partitions.get(key) {
+                Some(salt_partitions) => {
+                    let occurrence_index = heavy_occurrences.entry(key.to_string()).or_insert(0);
+                    let salt_index = *occurrence_index % salt_partitions.len().max(1);
+                    *occurrence_index += 1;
+                    let partition_id = salt_partitions
+                        .get(&salt_index)
+                        .copied()
+                        .unwrap_or_else(|| hashing::partition_id(key, output_partitions, seed));
+                    (partition_id, Some(salt_index))
+                }
+                None => {
+                    let partition_id = normal_partitions
+                        .get(key)
+                        .copied()
+                        .unwrap_or_else(|| hashing::partition_id(key, output_partitions, seed));
+                    (partition_id, None)
+                }
+            },
+            None => (
+                hashing::partition_id("<missing_partition_key>", output_partitions, seed),
+                None,
+            ),
+        };
+
+        if let Some(row_count) = partition_row_counts.get_mut(partition_id) {
+            *row_count += 1;
+        }
+
+        records.push(RecordPartitionAssignment {
+            row_index,
+            key,
+            partition_id,
+            salt_index,
+        });
+    }
+
+    ChunkAssignment {
+        partition_row_counts,
+        records,
+    }
+}
+
+fn count_heavy_keys_by_chunk(
+    dataset: &InputDataset,
+    key_columns: &[String],
+    heavy_partitions: &BTreeMap<&str, BTreeMap<usize, usize>>,
+    ranges: &[(usize, usize)],
+) -> Vec<BTreeMap<String, usize>> {
+    thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(ranges.len());
+        for (start, end) in ranges.iter().copied() {
+            handles.push(scope.spawn(move || {
+                let mut counts = BTreeMap::new();
+                for row in &dataset.rows.rows[start..end] {
+                    let Some(key) = row.partition_key(key_columns) else {
+                        continue;
+                    };
+                    if heavy_partitions.contains_key(key.as_str()) {
+                        *counts.entry(key).or_insert(0) += 1;
+                    }
+                }
+                counts
+            }));
+        }
+
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("heavy key counter worker panicked"))
+            .collect()
+    })
+}
+
+fn heavy_offsets_by_chunk(
+    heavy_counts_by_chunk: &[BTreeMap<String, usize>],
+) -> Vec<BTreeMap<String, usize>> {
+    let mut running = BTreeMap::<String, usize>::new();
+    let mut offsets = Vec::with_capacity(heavy_counts_by_chunk.len());
+
+    for counts in heavy_counts_by_chunk {
+        offsets.push(running.clone());
+        for (key, count) in counts {
+            *running.entry(key.clone()).or_insert(0) += *count;
+        }
+    }
+
+    offsets
+}
+
+fn chunk_ranges(row_count: usize, chunk_size: usize) -> Vec<(usize, usize)> {
+    if row_count == 0 {
+        return Vec::new();
+    }
+
+    (0..row_count)
+        .step_by(chunk_size.max(1))
+        .map(|start| (start, (start + chunk_size).min(row_count)))
+        .collect()
+}
+
 fn normal_partition_lookup(plan: &Plan) -> BTreeMap<&str, usize> {
     plan.metadata
         .normal_keys
@@ -140,6 +361,28 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(first.records.len(), 8);
         assert_eq!(first.partition_row_counts.iter().sum::<u64>(), 8);
+    }
+
+    #[test]
+    fn parallel_assignment_matches_sequential_assignment() {
+        let config = example_config();
+        let values = (0..20_000).map(|index| {
+            if index % 3 == 0 {
+                "heavy".to_string()
+            } else {
+                format!("user_{:08}", index % 1024)
+            }
+        });
+        let dataset = InputDataset::from_rows(Dataset::from_key_values("user_id", values));
+        let statistics = compute_statistics(&config, &dataset).expect("statistics should compute");
+        let plan = build_plan(&config, &statistics).expect("plan should build");
+
+        let sequential = assign_partitions_with_threads(&plan, &dataset, 1)
+            .expect("sequential assignment should work");
+        let parallel = assign_partitions_with_threads(&plan, &dataset, 4)
+            .expect("parallel assignment should work");
+
+        assert_eq!(parallel, sequential);
     }
 
     #[test]

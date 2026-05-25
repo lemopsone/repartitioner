@@ -20,7 +20,14 @@ def main() -> None:
         args.heavy_key,
         args.heavy_fraction,
     )
-    metadata = write_dataset(args.output, user_ids, "heavy_key", args.seed)
+    metadata = write_dataset(
+        args.output,
+        user_ids,
+        "heavy_key",
+        args.seed,
+        part_rows=args.part_rows,
+        payload_columns=args.payload_columns,
+    )
     metadata.update(
         {
             "key_cardinality": args.key_cardinality,

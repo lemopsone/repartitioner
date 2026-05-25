@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -19,7 +20,11 @@ def main() -> None:
     parser.add_argument("--result", required=True, type=Path, help="Collected result JSON path.")
     parser.add_argument("--config", type=Path, help="Optional config path to write/use.")
     parser.add_argument("--key-column", default="user_id")
-    parser.add_argument("--job-type", choices=["group_by", "join"], default="group_by")
+    parser.add_argument(
+        "--job-type",
+        choices=["scan", "filter", "group_by", "join", "generic"],
+        default="group_by",
+    )
     parser.add_argument(
         "--join-right",
         type=Path,
@@ -29,7 +34,9 @@ def main() -> None:
     parser.add_argument("--target-partition-size-mb", type=int, default=128)
     parser.add_argument("--target-file-size-mb", type=int, default=128)
     parser.add_argument("--min-file-size-mb", type=int, default=16)
+    parser.add_argument("--min-partitions", type=int, default=1)
     parser.add_argument("--max-partitions", type=int, default=16)
+    parser.add_argument("--local-threads", type=int, default=os.cpu_count() or 1)
     parser.add_argument("--heavy-key-alpha", type=float, default=2.0)
     parser.add_argument("--heavy-hitter-mode", choices=["exact", "approximate"], default="exact")
     parser.add_argument("--approximate-capacity", type=int, default=10000)
@@ -62,7 +69,9 @@ def main() -> None:
         target_partition_size_mb=args.target_partition_size_mb,
         target_file_size_mb=args.target_file_size_mb,
         min_file_size_mb=args.min_file_size_mb,
+        min_partitions=args.min_partitions,
         max_partitions=args.max_partitions,
+        local_threads=args.local_threads,
         heavy_key_alpha=args.heavy_key_alpha,
         heavy_hitter_mode=args.heavy_hitter_mode,
         approximate_capacity=args.approximate_capacity,
@@ -131,7 +140,9 @@ def write_config(
     output_path: Path,
     key_column: str,
     target_partition_size_mb: int,
+    min_partitions: int,
     max_partitions: int,
+    local_threads: int,
     heavy_key_alpha: float,
     seed: int,
     target_file_size_mb: int = 128,
@@ -170,6 +181,7 @@ output:
 partitioning:
   key_columns: ["{key_column}"]
   target_partition_size_mb: {target_partition_size_mb}
+  min_partitions: {min_partitions}
   max_partitions: {max_partitions}
   strategy: "adaptive_hash_salt"
   heavy_key_alpha: {heavy_key_alpha}
@@ -190,7 +202,7 @@ job:
 {join_section}
 
 resources:
-  local_threads: 1
+  local_threads: {local_threads}
   memory_limit_mb: 1024
 """,
         encoding="utf-8",

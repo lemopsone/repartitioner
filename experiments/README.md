@@ -17,6 +17,9 @@ python3 experiments/generate_multi_heavy_key.py --output data/multi-heavy.parque
 python3 experiments/generate_zipf.py --output data/zipf.parquet --rows 100000 --zipf-exponent 1.2
 ```
 
+По умолчанию генераторы добавляют к каждой записи 8 числовых payload-колонок
+`payload_0..payload_7`. Количество можно изменить через `--payload-columns`.
+
 Запуск Rust-ядра через Python-обертку с генерацией отчета:
 
 ```bash
@@ -37,6 +40,153 @@ python3 experiments/collect_results.py \
 ```
 
 ## Полный набор экспериментов
+
+Для матрицы, описанной в исследовательском разделе ВКР
+(`1000000`, затем `5000000..25000000` с шагом `5000000`; четыре вида
+перекоса; операторы `scan`, `filter`, `group_by`, `join`), можно использовать:
+
+```bash
+python3 experiments/run_research.py \
+  --data-dir data/research \
+  --reports-dir reports/research \
+  --min-partitions 16 \
+  --max-partitions 16 \
+  --local-threads 8 \
+  --part-rows 1000000 \
+  --payload-columns 8 \
+  --shuffle-partitions 16 \
+  --spark-driver-memory 8g \
+  --spark-executor-memory 8g \
+  --parquet-batch-size 1024 \
+  --auto-broadcast-threshold-bytes -1 \
+  --dataset-repetitions 5 \
+  --spark-repetitions 3 \
+  --trim-fraction 0.2 \
+  --correctness-level basic \
+  --spark-mode suite
+```
+
+Скрипт сохраняет сводную таблицу `reports/research/summary.csv` с двумя
+вариантами для каждого опыта:
+
+- `baseline` — Spark читает исходный dataset;
+- `repartitioner` — Spark читает предобработанный dataset.
+
+Для графиков `rho` важно задавать больше одной целевой партиции. Если оставить
+`--min-partitions 1`, небольшие dataset могут оказаться меньше
+`--target-partition-size-mb`, и планировщик выберет одну партицию. Тогда
+`rho = 1.0` для baseline и repartitioner на таких точках. Для исследования с
+фиксированным числом downstream partitions используйте, например,
+`--min-partitions 16 --max-partitions 16`.
+
+Поля таблицы включают `spark_time_seconds`, `rho`,
+`preprocessing_seconds` и `total_with_preprocessing_seconds`.
+Для каждого `--dataset-repetitions` генерируется новый dataset с новым seed.
+Для каждого такого dataset Spark-измерения выполняются `--spark-repetitions`
+раз. По умолчанию используется `--spark-mode suite`: один Python-процесс
+создаёт один `SparkSession` и последовательно выполняет все Spark-замеры из
+`reports/research/spark/benchmark_tasks.json`. Это уменьшает шум от запуска JVM,
+Spark и Hadoop. Для старого поведения, где каждый замер запускает отдельный
+Spark-процесс, можно указать `--spark-mode per_process`.
+Генераторы пишут исходные dataset как директории с несколькими Parquet
+part-файлами; размер part-файла по строкам задаётся `--part-rows`. Это нужно,
+чтобы Rust preprocessor и Spark могли читать исходные данные параллельно.
+Для больших прогонов используется `--correctness-level basic`: benchmark
+сверяет размеры результатов, но не запускает дорогие checksum-проверки над
+полным результатом join. Полную проверку (`--correctness-level full`) лучше
+оставлять для smoke-run на малых данных.
+Для join-нагрузки auto-broadcast по умолчанию отключён
+(`--auto-broadcast-threshold-bytes -1`), а AQE выключен. Vectorized Parquet
+reader и Hadoop vectored IO также выключены по умолчанию, чтобы широкие
+payload-датасеты не давали резких всплесков Java heap при чтении локального
+Parquet. Heap Spark-процесса задаётся через `--spark-driver-memory` и
+`--spark-executor-memory`. Если нужно сравнить с обычными оптимизациями Spark,
+можно указать `--enable-aqe`, `--enable-vectorized-parquet`,
+`--enable-vectored-io` и положительный broadcast threshold.
+Для операторов `scan` и `filter` Rust preprocessor по умолчанию принимает
+no-op решение: физический rewrite не выполняется, metadata содержит
+`input_reused = true`, а Spark benchmark читает исходный dataset. Это нужно,
+поскольку эти операторы не создают key-based shuffle и не выигрывают от борьбы
+с перекосом.
+`summary.csv` содержит усреднённые значения, а все отдельные прогоны сохраняются
+в `summary_raw.csv`. Параметр `--trim-fraction 0.2` отбрасывает по 20%
+минимальных и максимальных значений перед вычислением среднего, если повторов
+достаточно. `rho` усредняется по независимым dataset-повторам.
+PNG-графики автоматически создаются в `reports/research/plots`. Каталог можно
+переопределить через `--plots-dir`, а построение отключить через `--no-plots`.
+
+Для быстрой проверки:
+
+```bash
+python3 experiments/run_research_smoke.py \
+  --rows 100000 \
+  --skews uniform heavy_key \
+  --workloads scan group_by \
+  --reports-dir reports/smoke \
+  --dataset-repetitions 2 \
+  --spark-repetitions 3
+```
+
+`run_research_smoke.py` создаёт dataset во временном каталоге ОС и удаляет его
+после завершения прогона. CSV/JSON-отчёты и графики остаются в `--reports-dir`.
+
+Повторное построение графиков по уже готовому CSV:
+
+```bash
+python3 experiments/plot_research.py \
+  --summary reports/research/summary.csv \
+  --plots-dir reports/research/plots
+```
+
+Для каждой пары `(вид перекоса, оператор)` создаются два графика:
+
+- `*_time.png` — зависимость времени Spark-оператора от объёма dataset;
+- `*_max_partition_rows.png` — максимальный размер партиции в строках;
+- `*_max_partition_bytes.png` — оценка максимального размера партиции в байтах;
+- `*_p95_partition_rows.png` — 95-й процентиль размера партиции в строках;
+- `*_p95_partition_bytes.png` — оценка 95-го процентиля размера партиции в байтах;
+- `*_cv.png` — коэффициент вариации размеров партиций;
+- `*_skew_reduction_factor.png` — во сколько раз уменьшен максимум относительно baseline;
+- `*_skew_remaining_ratio.png` — доля оставшегося перекоса относительно baseline;
+- `*_largest_partition_share.png` — доля всего dataset в самой большой партиции;
+- `*_max_minus_mean_rows.png` — разница между максимальной и средней партицией;
+- `*_max_over_target_rows.png` — отношение максимальной партиции к целевому размеру;
+- `*_tau.png` — вспомогательная метрика `rho = max_partition / mean_partition`.
+
+## Исследование качества переразбиения
+
+Для отдельного исследования на фиксированном объёме данных можно менять долю
+одного тяжёлого ключа и смотреть, насколько метод снижает отношение
+максимального размера партиции к среднему:
+
+```bash
+python3 experiments/run_partition_quality.py \
+  --data-dir /media/lemopsone/Useful/repartitioner_quality_data \
+  --reports-dir reports/partition-quality \
+  --rows 10000000 \
+  --partitions 16 \
+  --payload-columns 0 \
+  --local-threads 16 \
+  --release
+```
+
+По умолчанию проверяются доли тяжёлого ключа
+`0%, 5%, 10%, 20%, ..., 90%`. Скрипт сохраняет:
+
+- `reports/partition-quality/summary.csv`;
+- `reports/partition-quality/quality.png`.
+
+Метрика на графике:
+
+```text
+rho = max_partition_rows / mean_partition_rows
+```
+
+Для варианта `baseline` используется не физическая нарезка исходных Parquet
+файлов, а детерминированная оценка hash-разбиения по ключу на то же число
+партиций. Поэтому точки baseline стабильны и отражают именно перекос, который
+получает key-based shuffle. Сгенерированные dataset после каждой точки
+удаляются, если не указан `--keep-data`.
 
 Единый сценарный runner для раздела исследования:
 

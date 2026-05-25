@@ -1,10 +1,11 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, thread};
 
 use crate::{
-    config::HeavyHitterMode,
+    config::{DatasetFormat, HeavyHitterMode},
     dataset::Row,
     execution::ExecutionResources,
     hashing, heavy_hitters,
+    io::parquet,
     key_encoding::{key_value_to_string, key_value_type_name},
     manifest::{
         HeavyHitterDetectionMetadata, HeavyKeyPlan, InputFileStats, InputStats, JoinSideStatistics,
@@ -136,6 +137,243 @@ pub fn compute_statistics(config: &Config, dataset: &InputDataset) -> Result<Com
     };
 
     Ok(ComputedStatistics { metadata })
+}
+
+pub fn compute_parquet_statistics_streaming(
+    config: &Config,
+) -> Result<(InputDataset, ComputedStatistics)> {
+    let dataset = parquet::inspect_parquet_input(config)?;
+    let partials = parquet_statistics_partials(
+        &dataset.files,
+        &config.partitioning.key_columns,
+        config.resources.local_threads,
+    )?;
+    let (frequencies, key_values, observed_total_rows) =
+        merge_parquet_statistics_partials(partials);
+
+    let summary_size = frequencies.len();
+    let key_frequency_summary = KeyFrequencySummary {
+        frequencies,
+        detection_metadata: HeavyHitterDetectionMetadata {
+            mode: "exact".to_string(),
+            capacity: config.statistics.approximate_capacity.get(),
+            error_bound: "0".to_string(),
+            exact: true,
+            frequencies_truncated: false,
+            summary_size,
+            observed_total_rows,
+            max_error: Some(0),
+        },
+        key_frequencies_exact: true,
+        key_frequencies_truncated: false,
+        normal_keys_materialized: true,
+    };
+
+    let statistics = computed_statistics_from_key_summary(
+        config,
+        &dataset,
+        observed_total_rows,
+        key_frequency_summary,
+        key_values,
+    )?;
+
+    Ok((dataset, statistics))
+}
+
+#[derive(Debug)]
+struct ParquetStatisticsPartial {
+    frequencies: BTreeMap<String, u64>,
+    key_values: BTreeMap<String, PlanKey>,
+    observed_total_rows: u64,
+}
+
+fn parquet_statistics_partials(
+    files: &[crate::reader::InputFile],
+    key_columns: &[String],
+    local_threads: usize,
+) -> Result<Vec<ParquetStatisticsPartial>> {
+    if files.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let thread_count = local_threads.max(1).min(files.len());
+    if thread_count == 1 {
+        return files
+            .iter()
+            .map(|file| parquet_statistics_for_files(std::slice::from_ref(file), key_columns))
+            .collect();
+    }
+
+    let chunk_size = files.len().div_ceil(thread_count);
+    thread::scope(|scope| {
+        let handles = files
+            .chunks(chunk_size)
+            .map(|chunk| scope.spawn(move || parquet_statistics_for_files(chunk, key_columns)))
+            .collect::<Vec<_>>();
+
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("statistics worker panicked"))
+            .collect()
+    })
+}
+
+fn parquet_statistics_for_files(
+    files: &[crate::reader::InputFile],
+    key_columns: &[String],
+) -> Result<ParquetStatisticsPartial> {
+    let mut partial = ParquetStatisticsPartial {
+        frequencies: BTreeMap::new(),
+        key_values: BTreeMap::new(),
+        observed_total_rows: 0,
+    };
+
+    for file in files {
+        parquet::read_projected_batches_from_file(file, key_columns, &mut |batch| {
+            partial.observed_total_rows += batch.num_rows() as u64;
+            let column_indexes = parquet::key_column_indexes(&batch, key_columns)?;
+            for row_index in 0..batch.num_rows() {
+                let Some((encoded, plan_key)) = parquet::encoded_key_from_batch_with_indexes(
+                    &batch,
+                    key_columns,
+                    &column_indexes,
+                    row_index,
+                )?
+                else {
+                    continue;
+                };
+                *partial.frequencies.entry(encoded.clone()).or_insert(0) += 1;
+                partial.key_values.entry(encoded).or_insert(plan_key);
+            }
+            Ok(())
+        })?;
+    }
+
+    Ok(partial)
+}
+
+fn merge_parquet_statistics_partials(
+    partials: Vec<ParquetStatisticsPartial>,
+) -> (BTreeMap<String, u64>, BTreeMap<String, PlanKey>, u64) {
+    let mut frequencies = BTreeMap::<String, u64>::new();
+    let mut key_values = BTreeMap::<String, PlanKey>::new();
+    let mut observed_total_rows = 0;
+
+    for partial in partials {
+        observed_total_rows += partial.observed_total_rows;
+        for (key, frequency) in partial.frequencies {
+            *frequencies.entry(key).or_insert(0) += frequency;
+        }
+        for (key, value) in partial.key_values {
+            key_values.entry(key).or_insert(value);
+        }
+    }
+
+    (frequencies, key_values, observed_total_rows)
+}
+
+fn computed_statistics_from_key_summary(
+    config: &Config,
+    dataset: &InputDataset,
+    total_rows: u64,
+    key_frequency_summary: KeyFrequencySummary,
+    key_values: BTreeMap<String, PlanKey>,
+) -> Result<ComputedStatistics> {
+    let mut resources = resource_estimate(config, dataset)?;
+    resources.in_memory_processing_used = false;
+    let file_size_summary = file_size_summary(config, dataset);
+    let key_frequencies_exact = key_frequency_summary.key_frequencies_exact;
+    let key_frequencies_truncated = key_frequency_summary.key_frequencies_truncated;
+    let normal_keys_materialized = key_frequency_summary.normal_keys_materialized;
+    let distinct_keys =
+        key_frequencies_exact.then_some(key_frequency_summary.frequencies.len() as u64);
+    let key_frequencies = key_frequency_summary.frequencies;
+    let mean_key_frequency = mean_frequency(&key_frequencies);
+    let max_key_frequency = max_frequency(&key_frequencies);
+    let estimated_row_width_bytes = estimated_row_width_bytes_for_rows(dataset, total_rows);
+    let target_partitioning =
+        targeting::compute_target_partitioning(config, total_rows, estimated_row_width_bytes);
+    let heavy_hitter_candidates = heavy_hitters::detect_heavy_hitter_candidates(
+        &key_frequencies,
+        config.partitioning.heavy_key_alpha,
+    )
+    .into_iter()
+    .map(|heavy| heavy_key_plan_placeholder(heavy, &key_values))
+    .collect();
+    let heavy_hitters = heavy_hitters::detect_final_heavy_keys(
+        &key_frequencies,
+        config.partitioning.heavy_key_alpha,
+        target_partitioning.target_partition_rows,
+    )
+    .into_iter()
+    .map(|heavy| heavy_key_plan_placeholder(heavy, &key_values))
+    .collect();
+    let partition_sizes = base_partition_sizes_from_frequencies(
+        &key_frequencies,
+        target_partitioning.output_partitions,
+        config.partitioning.seed,
+    );
+    let skew = skew_stats(&partition_sizes);
+
+    let metadata = StatsMetadata {
+        version: METADATA_VERSION.to_string(),
+        input: InputStats {
+            total_rows,
+            input_file_count: dataset.files.len(),
+            input_files: dataset
+                .files
+                .iter()
+                .map(|file| InputFileStats {
+                    path: file.path.clone(),
+                    size_bytes: file.size_bytes,
+                })
+                .collect(),
+            min_file_size_bytes: file_size_summary.min_file_size_bytes,
+            max_file_size_bytes: file_size_summary.max_file_size_bytes,
+            mean_file_size_bytes: file_size_summary.mean_file_size_bytes,
+            small_file_count: file_size_summary.small_file_count,
+            oversized_file_count: file_size_summary.oversized_file_count,
+            estimated_row_width_bytes,
+            distinct_keys,
+            key_frequencies_exact,
+            key_frequencies_truncated,
+            normal_keys_materialized,
+            mean_key_frequency,
+            max_key_frequency,
+            key_frequencies,
+            heavy_hitter_candidates,
+            heavy_hitters,
+        },
+        heavy_hitter_detection: key_frequency_summary.detection_metadata,
+        storage: StorageMetadata {
+            target_file_size_mb: config.storage.target_file_size_mb.get(),
+            min_file_size_mb: config.storage.min_file_size_mb.get(),
+            target_file_size_bytes: mb_to_bytes(config.storage.target_file_size_mb.get()),
+            min_file_size_bytes: mb_to_bytes(config.storage.min_file_size_mb.get()),
+        },
+        join: None,
+        before_skew: skew.clone(),
+        after_skew: None,
+        skew,
+        partition_bound: PartitionBoundMetadata::new(
+            target_partitioning.target_partition_rows,
+            partition_sizes.as_slice(),
+        ),
+        estimates: PartitionEstimates {
+            target_partitions: target_partitioning.output_partitions,
+            before_partition_sizes: partition_sizes,
+            after_partition_sizes: vec![0; target_partitioning.output_partitions],
+        },
+        resources,
+        timing: None,
+    };
+
+    Ok(ComputedStatistics { metadata })
+}
+
+pub fn can_use_streaming_statistics(config: &Config) -> bool {
+    config.dataset.input_format == DatasetFormat::Parquet
+        && config.statistics.heavy_hitter_mode == HeavyHitterMode::Exact
 }
 
 pub fn build_join_statistics(
@@ -297,7 +535,10 @@ fn heavy_key_plan_placeholder(
 }
 
 fn estimated_row_width_bytes(dataset: &InputDataset) -> Option<u64> {
-    let total_rows = dataset.rows.row_count();
+    estimated_row_width_bytes_for_rows(dataset, dataset.rows.row_count())
+}
+
+fn estimated_row_width_bytes_for_rows(dataset: &InputDataset, total_rows: u64) -> Option<u64> {
     if total_rows == 0 {
         return None;
     }
@@ -436,6 +677,25 @@ fn base_partition_sizes(
             let partition_id = hashing::partition_id(&key, partition_count, seed);
             sizes[partition_id] += 1;
         }
+    }
+
+    sizes
+}
+
+fn base_partition_sizes_from_frequencies(
+    key_frequencies: &BTreeMap<String, u64>,
+    partition_count: usize,
+    seed: u64,
+) -> Vec<u64> {
+    let mut sizes = vec![0; partition_count];
+
+    if partition_count == 0 {
+        return sizes;
+    }
+
+    for (key, frequency) in key_frequencies {
+        let partition_id = hashing::partition_id(key, partition_count, seed);
+        sizes[partition_id] += *frequency;
     }
 
     sizes
@@ -881,17 +1141,14 @@ resources:
         );
         assert_eq!(statistics.metadata.resources.configured_local_threads, 8);
         assert_eq!(statistics.metadata.resources.local_threads_used, 8);
-        assert!(!statistics.metadata.resources.parallel_execution_enabled);
+        assert!(statistics.metadata.resources.parallel_execution_enabled);
         assert_eq!(
             statistics.metadata.resources.estimated_dataset_size_mb,
             Some(1)
         );
         assert!(statistics.metadata.resources.in_memory_processing_used);
         assert!(!statistics.metadata.resources.memory_limit_exceeded);
-        assert_eq!(
-            statistics.metadata.resources.warnings,
-            vec!["local_threads_configured_but_not_used_for_parallel_execution".to_string()]
-        );
+        assert!(statistics.metadata.resources.warnings.is_empty());
     }
 
     #[test]
@@ -918,12 +1175,8 @@ resources:
 
         let statistics = compute_statistics(&config, &dataset).expect("statistics should compute");
 
-        assert!(!statistics.metadata.resources.parallel_execution_enabled);
-        assert!(statistics
-            .metadata
-            .resources
-            .warnings
-            .contains(&"local_threads_configured_but_not_used_for_parallel_execution".to_string()));
+        assert!(statistics.metadata.resources.parallel_execution_enabled);
+        assert!(statistics.metadata.resources.warnings.is_empty());
     }
 
     #[test]

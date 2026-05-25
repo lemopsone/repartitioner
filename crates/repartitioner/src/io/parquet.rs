@@ -1,4 +1,14 @@
-use std::{collections::BTreeMap, fs, fs::File, path::Path, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    fs,
+    fs::File,
+    path::Path,
+    sync::{
+        mpsc::{sync_channel, Receiver, SyncSender},
+        Arc,
+    },
+    thread,
+};
 
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Decimal256Array, Int16Array,
@@ -16,8 +26,8 @@ use crate::{
     io::{DatasetReader, DatasetWriter, KeyBatchScanner, RecordBatchScanner},
     key_encoding::{key_value_to_string, KeyValue},
     manifest::{
-        Manifest, OutputFile, PartitionManifest, PartitionPlan, StatsMetadata, TechnicalColumns,
-        METADATA_VERSION,
+        Manifest, OutputFile, PartitionManifest, PartitionPlan, PlanKey, PlanKeyPart,
+        StatsMetadata, TechnicalColumns, METADATA_VERSION,
     },
     partitioner::{PartitionAssignmentSummary, RecordPartitionAssignment},
     reader::{InputDataset, InputFile},
@@ -88,11 +98,33 @@ impl DatasetWriter for ParquetDatasetWriter {
     }
 }
 
+impl ParquetDatasetWriter {
+    pub fn write_output_streaming_assignments(
+        &self,
+        output_dir: &Path,
+        plan: &PartitionPlan,
+        stats: &StatsMetadata,
+        dataset: &InputDataset,
+    ) -> Result<WriteSummary> {
+        write_parquet_output_streaming_assignments(output_dir, plan, stats, dataset)
+    }
+}
+
+pub(crate) fn inspect_parquet_input(config: &Config) -> Result<InputDataset> {
+    inspect_local_files(&config.dataset.input, DatasetFormat::Parquet)
+}
+
 fn inspect_local_input(
     input: &Path,
     format: DatasetFormat,
     key_columns: &[String],
 ) -> Result<InputDataset> {
+    let mut dataset = inspect_local_files(input, format)?;
+    dataset.rows = read_parquet_keys(&dataset.files, key_columns)?;
+    Ok(dataset)
+}
+
+fn inspect_local_files(input: &Path, format: DatasetFormat) -> Result<InputDataset> {
     let files = if input.is_file() {
         vec![inspect_file(input)?]
     } else if input.is_dir() {
@@ -111,13 +143,11 @@ fn inspect_local_input(
         });
     }
 
-    let rows = read_parquet_keys(&files, key_columns)?;
-
     Ok(InputDataset {
         path: input.display().to_string(),
         format,
         files,
-        rows,
+        rows: Dataset::empty(),
         batches: Vec::new(),
     })
 }
@@ -197,7 +227,75 @@ fn read_parquet_keys(files: &[InputFile], key_columns: &[String]) -> Result<Data
     Ok(Dataset::new(rows))
 }
 
-fn key_value(column: &str, array: &dyn Array, row_index: usize) -> Result<KeyValue> {
+pub(crate) fn read_projected_batches_from_file(
+    input_file: &InputFile,
+    columns: &[String],
+    visitor: &mut dyn FnMut(RecordBatch) -> Result<()>,
+) -> Result<()> {
+    let file = File::open(&input_file.path).map_err(|source| Error::ReadFile {
+        path: input_file.path.clone().into(),
+        source,
+    })?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let projection =
+        ProjectionMask::columns(builder.parquet_schema(), columns.iter().map(String::as_str));
+    let reader = builder.with_projection(projection).build()?;
+
+    for batch in reader {
+        visitor(batch?)?;
+    }
+
+    Ok(())
+}
+
+pub(crate) fn key_column_indexes(
+    batch: &RecordBatch,
+    key_columns: &[String],
+) -> Result<Vec<usize>> {
+    let schema = batch.schema();
+    key_columns
+        .iter()
+        .map(|column| schema.index_of(column).map_err(Error::from))
+        .collect()
+}
+
+pub(crate) fn encoded_key_from_batch_with_indexes(
+    batch: &RecordBatch,
+    key_columns: &[String],
+    column_indexes: &[usize],
+    row_index: usize,
+) -> Result<Option<(String, PlanKey)>> {
+    let mut key_values = BTreeMap::new();
+    let mut parts = Vec::with_capacity(key_columns.len());
+
+    for (column, column_index) in key_columns.iter().zip(column_indexes.iter()) {
+        let value = key_value(column, batch.column(*column_index).as_ref(), row_index)?;
+        let encoded_part = crate::key_encoding::encode_key_part(column, &value);
+        parts.push(PlanKeyPart {
+            column: column.clone(),
+            value_type: crate::key_encoding::key_value_type_name(&value).to_string(),
+            value: key_value_to_string(&value),
+        });
+        key_values.insert(column.clone(), value);
+        if encoded_part.is_empty() {
+            return Ok(None);
+        }
+    }
+
+    let encoded = key_columns
+        .iter()
+        .filter_map(|column| {
+            key_values
+                .get(column)
+                .map(|value| crate::key_encoding::encode_key_part(column, value))
+        })
+        .collect::<Vec<_>>()
+        .join("|");
+
+    Ok(Some((encoded.clone(), PlanKey { encoded, parts })))
+}
+
+pub(crate) fn key_value(column: &str, array: &dyn Array, row_index: usize) -> Result<KeyValue> {
     if array.is_null(row_index) {
         return Ok(KeyValue::Null);
     }
@@ -373,6 +471,30 @@ fn write_parquet_output(
     Ok(WriteSummary { manifest })
 }
 
+fn write_parquet_output_streaming_assignments(
+    output_dir: &Path,
+    plan: &PartitionPlan,
+    stats: &StatsMetadata,
+    dataset: &InputDataset,
+) -> Result<WriteSummary> {
+    fs::create_dir_all(output_dir).map_err(|source| Error::WriteFile {
+        path: output_dir.to_path_buf(),
+        source,
+    })?;
+
+    let (output_files, partition_row_counts) =
+        write_streaming_parquet_output_with_assignments(output_dir, plan, stats, dataset)?;
+    let manifest = manifest_from_partition_counts(
+        partition_row_counts,
+        Some(output_dir.display().to_string()),
+        output_files,
+    );
+
+    write_metadata_files(output_dir, plan, stats, &manifest)?;
+
+    Ok(WriteSummary { manifest })
+}
+
 fn write_retained_parquet_output(
     output_dir: &Path,
     plan: &PartitionPlan,
@@ -443,6 +565,283 @@ fn write_streaming_parquet_output(
     }
 
     Ok(state.output_files)
+}
+
+fn write_streaming_parquet_output_with_assignments(
+    output_dir: &Path,
+    plan: &PartitionPlan,
+    stats: &StatsMetadata,
+    dataset: &InputDataset,
+) -> Result<(Vec<OutputFile>, Vec<u64>)> {
+    if stats.resources.local_threads_used > 1 && plan.output_partitions > 1 {
+        return write_streaming_parquet_output_with_writer_workers(
+            output_dir, plan, stats, dataset,
+        );
+    }
+
+    let mut state = StreamingOutputState::new(stats.resources.local_threads_used);
+    let mut assignment_state = StreamingAssignmentState::new(plan);
+    let file_sizing = FileSizing::from_stats(stats);
+    let scanner = ParquetDatasetReader;
+
+    scanner.scan_record_batches(dataset, &mut |_batch_start, batch| {
+        let local_assignments = assignment_state.assign_batch(plan, &batch)?;
+        write_streamed_batch_with_assignments(
+            output_dir,
+            plan,
+            batch,
+            &local_assignments,
+            file_sizing,
+            &mut state,
+        )
+    })?;
+
+    let partition_ids = state.open_writers.keys().copied().collect::<Vec<_>>();
+    for partition_id in partition_ids {
+        close_partition_writer(output_dir, partition_id, &mut state)?;
+    }
+
+    Ok((state.output_files, assignment_state.partition_row_counts))
+}
+
+fn write_streaming_parquet_output_with_writer_workers(
+    output_dir: &Path,
+    plan: &PartitionPlan,
+    stats: &StatsMetadata,
+    dataset: &InputDataset,
+) -> Result<(Vec<OutputFile>, Vec<u64>)> {
+    let worker_count = stats
+        .resources
+        .local_threads_used
+        .max(1)
+        .min(plan.output_partitions.max(1));
+    let file_sizing = FileSizing::from_stats(stats);
+    let mut assignment_state = StreamingAssignmentState::new(plan);
+    let mut senders = Vec::with_capacity(worker_count);
+
+    let output_files = thread::scope(|scope| -> Result<Vec<OutputFile>> {
+        let mut handles = Vec::with_capacity(worker_count);
+        for _worker_id in 0..worker_count {
+            let (sender, receiver) = sync_channel::<PartitionWriteBatch>(worker_count * 2);
+            senders.push(sender);
+            handles.push(scope.spawn(move || {
+                writer_worker(
+                    output_dir,
+                    receiver,
+                    file_sizing,
+                    plan.output_partitions.div_ceil(worker_count).max(1),
+                )
+            }));
+        }
+
+        let scanner = ParquetDatasetReader;
+        scanner.scan_record_batches(dataset, &mut |_batch_start, batch| {
+            let local_assignments = assignment_state.assign_batch(plan, &batch)?;
+            send_partition_batches(
+                &senders,
+                worker_count,
+                plan,
+                batch,
+                &local_assignments,
+                file_sizing,
+            )
+        })?;
+
+        drop(senders);
+
+        let mut output_files = Vec::new();
+        for handle in handles {
+            output_files.extend(handle.join().expect("writer worker panicked")?);
+        }
+        Ok(output_files)
+    })?;
+
+    Ok((output_files, assignment_state.partition_row_counts))
+}
+
+struct PartitionWriteBatch {
+    partition_id: usize,
+    batch: RecordBatch,
+    estimated_size_bytes: u64,
+}
+
+fn send_partition_batches(
+    senders: &[SyncSender<PartitionWriteBatch>],
+    worker_count: usize,
+    plan: &PartitionPlan,
+    batch: RecordBatch,
+    local_assignments: &[RecordPartitionAssignment],
+    file_sizing: FileSizing,
+) -> Result<()> {
+    let mut local_by_partition = BTreeMap::<usize, Vec<(u32, RecordPartitionAssignment)>>::new();
+
+    for (local_index, assignment) in local_assignments.iter().enumerate() {
+        local_by_partition
+            .entry(assignment.partition_id)
+            .or_default()
+            .push((local_index as u32, assignment.clone()));
+    }
+
+    for (partition_id, rows) in local_by_partition {
+        if partition_id >= plan.output_partitions {
+            continue;
+        }
+
+        for row_chunk in rows.chunks(file_sizing.max_rows_per_file) {
+            let local_indexes = row_chunk
+                .iter()
+                .map(|(local_index, _)| *local_index)
+                .collect::<Vec<_>>();
+            let local_assignments = row_chunk
+                .iter()
+                .map(|(_, assignment)| assignment.clone())
+                .collect::<Vec<_>>();
+            let output_batch = take_batch(&batch, &local_indexes)?;
+            let output_batch = append_technical_columns(
+                output_batch,
+                &local_assignments,
+                &plan.technical_columns,
+            )?;
+            let estimated_size_bytes =
+                file_sizing.estimated_batch_size_bytes(output_batch.num_rows());
+            let worker_id = partition_id % worker_count;
+            senders[worker_id]
+                .send(PartitionWriteBatch {
+                    partition_id,
+                    batch: output_batch,
+                    estimated_size_bytes,
+                })
+                .map_err(|_| {
+                    Error::UnsupportedFormat(
+                        "Parquet writer worker stopped unexpectedly".to_string(),
+                    )
+                })?;
+        }
+    }
+
+    Ok(())
+}
+
+fn writer_worker(
+    output_dir: &Path,
+    receiver: Receiver<PartitionWriteBatch>,
+    file_sizing: FileSizing,
+    open_writer_limit: usize,
+) -> Result<Vec<OutputFile>> {
+    let mut state = StreamingOutputState::new(open_writer_limit);
+
+    while let Ok(message) = receiver.recv() {
+        write_partition_output_batch(
+            output_dir,
+            message.partition_id,
+            message.batch,
+            message.estimated_size_bytes,
+            file_sizing.target_file_size_bytes,
+            &mut state,
+        )?;
+    }
+
+    let partition_ids = state.open_writers.keys().copied().collect::<Vec<_>>();
+    for partition_id in partition_ids {
+        close_partition_writer(output_dir, partition_id, &mut state)?;
+    }
+
+    Ok(state.output_files)
+}
+
+struct StreamingAssignmentState<'a> {
+    normal_partitions: BTreeMap<&'a str, usize>,
+    heavy_partitions: BTreeMap<&'a str, BTreeMap<usize, usize>>,
+    heavy_occurrences: BTreeMap<String, usize>,
+    partition_row_counts: Vec<u64>,
+}
+
+impl<'a> StreamingAssignmentState<'a> {
+    fn new(plan: &'a PartitionPlan) -> Self {
+        Self {
+            normal_partitions: plan
+                .normal_keys
+                .iter()
+                .map(|key| (key.key.as_str(), key.partition_id))
+                .collect(),
+            heavy_partitions: plan
+                .heavy_keys
+                .iter()
+                .map(|key| {
+                    let salt_partitions = key
+                        .salt_partitions
+                        .iter()
+                        .map(|salt| (salt.salt_index, salt.partition_id))
+                        .collect();
+                    (key.key.as_str(), salt_partitions)
+                })
+                .collect(),
+            heavy_occurrences: BTreeMap::new(),
+            partition_row_counts: vec![0; plan.output_partitions],
+        }
+    }
+
+    fn assign_batch(
+        &mut self,
+        plan: &PartitionPlan,
+        batch: &RecordBatch,
+    ) -> Result<Vec<RecordPartitionAssignment>> {
+        let mut assignments = Vec::with_capacity(batch.num_rows());
+        let column_indexes = key_column_indexes(batch, &plan.key_columns)?;
+        for row_index in 0..batch.num_rows() {
+            let key = encoded_key_from_batch_with_indexes(
+                batch,
+                &plan.key_columns,
+                &column_indexes,
+                row_index,
+            )?
+            .map(|(encoded, _)| encoded);
+            let (partition_id, salt_index) = match key.as_deref() {
+                Some(key) => match self.heavy_partitions.get(key) {
+                    Some(salt_partitions) => {
+                        let occurrence_index =
+                            self.heavy_occurrences.entry(key.to_string()).or_insert(0);
+                        let salt_index = *occurrence_index % salt_partitions.len().max(1);
+                        *occurrence_index += 1;
+                        let partition_id = salt_partitions
+                            .get(&salt_index)
+                            .copied()
+                            .unwrap_or_else(|| {
+                                crate::hashing::partition_id(key, plan.output_partitions, plan.seed)
+                            });
+                        (partition_id, Some(salt_index))
+                    }
+                    None => {
+                        let partition_id =
+                            self.normal_partitions.get(key).copied().unwrap_or_else(|| {
+                                crate::hashing::partition_id(key, plan.output_partitions, plan.seed)
+                            });
+                        (partition_id, None)
+                    }
+                },
+                None => (
+                    crate::hashing::partition_id(
+                        "<missing_partition_key>",
+                        plan.output_partitions,
+                        plan.seed,
+                    ),
+                    None,
+                ),
+            };
+
+            if let Some(row_count) = self.partition_row_counts.get_mut(partition_id) {
+                *row_count += 1;
+            }
+            assignments.push(RecordPartitionAssignment {
+                row_index,
+                key,
+                partition_id,
+                salt_index,
+            });
+        }
+
+        Ok(assignments)
+    }
 }
 
 struct StreamingOutputState {
@@ -571,6 +970,92 @@ fn write_streamed_batch(
     Ok(())
 }
 
+fn write_streamed_batch_with_assignments(
+    output_dir: &Path,
+    plan: &PartitionPlan,
+    batch: RecordBatch,
+    local_assignments: &[RecordPartitionAssignment],
+    file_sizing: FileSizing,
+    state: &mut StreamingOutputState,
+) -> Result<()> {
+    let mut local_by_partition = BTreeMap::<usize, Vec<(u32, RecordPartitionAssignment)>>::new();
+
+    for (local_index, assignment) in local_assignments.iter().enumerate() {
+        local_by_partition
+            .entry(assignment.partition_id)
+            .or_default()
+            .push((local_index as u32, assignment.clone()));
+    }
+
+    for (partition_id, rows) in local_by_partition {
+        if partition_id >= plan.output_partitions {
+            continue;
+        }
+
+        for row_chunk in rows.chunks(file_sizing.max_rows_per_file) {
+            let local_indexes = row_chunk
+                .iter()
+                .map(|(local_index, _)| *local_index)
+                .collect::<Vec<_>>();
+            let local_assignments = row_chunk
+                .iter()
+                .map(|(_, assignment)| assignment.clone())
+                .collect::<Vec<_>>();
+            let output_batch = take_batch(&batch, &local_indexes)?;
+            let output_batch = append_technical_columns(
+                output_batch,
+                &local_assignments,
+                &plan.technical_columns,
+            )?;
+            write_partition_output_batch(
+                output_dir,
+                partition_id,
+                output_batch,
+                file_sizing.estimated_batch_size_bytes(local_assignments.len()),
+                file_sizing.target_file_size_bytes,
+                state,
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn write_partition_output_batch(
+    output_dir: &Path,
+    partition_id: usize,
+    output_batch: RecordBatch,
+    estimated_size_bytes: u64,
+    target_file_size_bytes: u64,
+    state: &mut StreamingOutputState,
+) -> Result<()> {
+    if should_roll_partition_writer(
+        partition_id,
+        estimated_size_bytes,
+        target_file_size_bytes,
+        &state.open_writers,
+    ) {
+        close_partition_writer(output_dir, partition_id, state)?;
+    }
+    ensure_open_writer_capacity(output_dir, partition_id, state)?;
+
+    let row_count = output_batch.num_rows();
+    let writer = partition_writer(
+        output_dir,
+        partition_id,
+        output_batch.schema(),
+        &mut state.open_writers,
+        &mut state.next_file_indexes,
+    )?;
+    writer.writer.write(&output_batch)?;
+    writer.row_count += row_count as u64;
+    writer.estimated_size_bytes = writer
+        .estimated_size_bytes
+        .saturating_add(estimated_size_bytes);
+
+    Ok(())
+}
+
 fn should_roll_partition_writer(
     partition_id: usize,
     next_batch_size_bytes: u64,
@@ -684,6 +1169,42 @@ fn manifest_from_output_files(
 ) -> Manifest {
     let partitions = assignments
         .partition_row_counts
+        .iter()
+        .enumerate()
+        .map(|(partition_id, row_count)| {
+            let partition_files: Vec<_> = output_files
+                .iter()
+                .filter(|file| file.partition_id == partition_id)
+                .collect();
+            let size_bytes = partition_files
+                .iter()
+                .filter_map(|file| file.size_bytes)
+                .reduce(|left, right| left + right);
+
+            PartitionManifest {
+                partition_id,
+                row_count: *row_count,
+                file_count: partition_files.len(),
+                size_bytes,
+            }
+        })
+        .collect();
+
+    Manifest {
+        version: METADATA_VERSION.to_string(),
+        input_reused: false,
+        dataset_location,
+        output_files,
+        partitions,
+    }
+}
+
+fn manifest_from_partition_counts(
+    partition_row_counts: Vec<u64>,
+    dataset_location: Option<String>,
+    output_files: Vec<OutputFile>,
+) -> Manifest {
+    let partitions = partition_row_counts
         .iter()
         .enumerate()
         .map(|(partition_id, row_count)| {
