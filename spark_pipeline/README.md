@@ -9,7 +9,20 @@
 pip install -r spark_pipeline/requirements.txt
 ```
 
-Два прогона (JOIN + groupBy):
+Spark/Hadoop для этих скриптов нужно запускать на JDK 17. На Linux Mint:
+
+```bash
+sudo apt install openjdk-17-jdk
+export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+export PATH="$JAVA_HOME/bin:$PATH"
+java -version
+```
+
+Если запустить benchmark на слишком новой Java, например JDK 24/25, Hadoop
+может упасть с ошибкой `Subject.getSubject is not supported`. Скрипты проверяют
+это до создания `SparkSession` и выводят понятную ошибку.
+
+Все четыре оператора (`scan`, `filter`, `group_by`, `join`):
 
 ```bash
 python3 spark_pipeline/benchmark.py \
@@ -20,10 +33,55 @@ python3 spark_pipeline/benchmark.py \
   --shuffle-partitions 16
 ```
 
+По умолчанию benchmark отключает auto-broadcast join
+(`spark.sql.autoBroadcastJoinThreshold = -1`) и AQE
+(`spark.sql.adaptive.enabled = false`), чтобы shuffle-нагрузки были
+повторяемыми и перекос не скрывался оптимизациями Spark. Для широких payload
+dataset также отключены vectorized Parquet reader и Hadoop vectored IO; это
+уменьшает риск `Java heap space` при чтении локального Parquet. Heap задаётся
+через `--driver-memory` и `--executor-memory`.
+
+Для обратного режима можно передать `--auto-broadcast-threshold-bytes <bytes>`,
+`--enable-aqe`, `--enable-vectorized-parquet` и `--enable-vectored-io`.
+
+Текущие workload-и намеренно читают payload-колонки:
+
+- `scan`: `count(*)` и суммы по `value`, `payload_0..payload_N`;
+- `filter`: фильтр по hash ключа, затем `count(*)` и суммы по payload;
+- `group_by`: `groupBy(key)` с `count(*)` и суммами по payload;
+- `join`: shuffle join по ключу, затем `count`, `countDistinct(key)` и суммы
+  по payload результата.
+
+Для исследовательского прогона предпочтительно использовать suite-режим из
+`experiments/run_research.py`: он создаёт один `SparkSession` и выполняет все
+замеры последовательно внутри одного Spark-процесса. Внутренний скрипт
+`spark_pipeline/benchmark_suite.py` принимает JSON со списком задач и обычно не
+запускается вручную.
+
+Только scan:
+
+```bash
+python3 spark_pipeline/run_scan.py \
+  --original data/heavy.parquet \
+  --preprocessed data/heavy_partitioned \
+  --json-report reports/scan-heavy.json \
+  --csv-report reports/scan-heavy.csv
+```
+
+Только filter:
+
+```bash
+python3 spark_pipeline/run_filter.py \
+  --original data/heavy.parquet \
+  --preprocessed data/heavy_partitioned \
+  --json-report reports/filter-heavy.json \
+  --csv-report reports/filter-heavy.csv
+```
+
 Для `group_by` отчёт содержит три режима:
 
-- `baseline`: `original.groupBy(key_column).count()`.
-- `physical_only`: `preprocessed.groupBy(key_column).count()`.
+- `baseline`: `original.groupBy(key_column)` с `count` и payload-агрегатами.
+- `physical_only`: `preprocessed.groupBy(key_column)` с теми же агрегатами.
 - `method_aware`: двухстадийная агрегация по техническим колонкам партиции,
   salt и исходному ключу.
 
@@ -54,8 +112,8 @@ python3 spark_pipeline/run_groupby.py \
 В JSON/CSV отчётах поле `mode` разделяет `baseline`, `physical_only` и
 `method_aware`. Для groupBy блок `correctness` сохраняет старые проверки размеров,
 а также содержит строгую сверку counts по каждому ключу:
-`exact_group_counts_match`, `group_count_diff_rows` и checksum по `(key,
-count)`. Для join блок `correctness` сохраняет проверки размеров и добавляет
+`exact_group_counts_match`, `group_count_diff_rows` и checksum по ключу,
+`count` и payload-агрегатам. Для join блок `correctness` сохраняет проверки размеров и добавляет
 `checksum_matches_baseline` по стабильному набору логических колонок результата.
 Технические `_rp_*`/Hive partition columns не участвуют в join checksum.
 

@@ -39,6 +39,26 @@ pub fn write_output(
     }
 }
 
+pub fn write_output_streaming_assignments(
+    output_dir: impl AsRef<Path>,
+    output_format: &DatasetFormat,
+    plan: &PartitionPlan,
+    stats: &StatsMetadata,
+    dataset: &InputDataset,
+) -> Result<WriteSummary> {
+    match output_format {
+        DatasetFormat::Parquet => ParquetDatasetWriter.write_output_streaming_assignments(
+            output_dir.as_ref(),
+            plan,
+            stats,
+            dataset,
+        ),
+        DatasetFormat::Csv => Err(Error::UnsupportedFormat(
+            "CSV output is not implemented; use output.format = parquet".to_string(),
+        )),
+    }
+}
+
 pub fn write_no_op_output(
     output_dir: impl AsRef<Path>,
     plan: &PartitionPlan,

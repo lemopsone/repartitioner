@@ -8,7 +8,14 @@ def main() -> None:
     args = parser.parse_args()
 
     user_ids = zipf_keys(args.rows, args.key_cardinality, args.seed, args.zipf_exponent)
-    metadata = write_dataset(args.output, user_ids, "zipf", args.seed)
+    metadata = write_dataset(
+        args.output,
+        user_ids,
+        "zipf",
+        args.seed,
+        part_rows=args.part_rows,
+        payload_columns=args.payload_columns,
+    )
     metadata.update(
         {
             "key_cardinality": args.key_cardinality,

@@ -4,6 +4,8 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import re
+import subprocess
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -32,10 +34,10 @@ class BenchmarkResult:
 
 
 def main() -> None:
-    parser = base_parser("Run Spark groupBy/join benchmarks against original and preprocessed datasets.")
+    parser = base_parser("Run Spark scan/filter/groupBy/join benchmarks.")
     parser.add_argument(
         "--workload",
-        choices=["group_by", "join", "all"],
+        choices=["scan", "filter", "group_by", "join", "all"],
         default="all",
         help="Spark workload to run.",
     )
@@ -62,6 +64,35 @@ def base_parser(description: str) -> argparse.ArgumentParser:
     parser.add_argument("--csv-report", required=True, type=Path)
     parser.add_argument("--app-name", default="repartitioner-benchmark")
     parser.add_argument("--shuffle-partitions", type=int, default=200)
+    parser.add_argument("--driver-memory", default="8g")
+    parser.add_argument("--executor-memory", default="8g")
+    parser.add_argument(
+        "--auto-broadcast-threshold-bytes",
+        type=int,
+        default=-1,
+        help="Spark auto broadcast join threshold. Default disables auto broadcast.",
+    )
+    parser.add_argument(
+        "--enable-aqe",
+        action="store_true",
+        help="Enable Spark adaptive query execution. Disabled by default for repeatable skew tests.",
+    )
+    parser.add_argument(
+        "--parquet-batch-size",
+        type=int,
+        default=1024,
+        help="Spark vectorized Parquet reader batch size if vectorized reader is enabled.",
+    )
+    parser.add_argument(
+        "--enable-vectorized-parquet",
+        action="store_true",
+        help="Enable Spark vectorized Parquet reader. Disabled by default to reduce heap spikes.",
+    )
+    parser.add_argument(
+        "--enable-vectored-io",
+        action="store_true",
+        help="Enable Parquet/Hadoop vectored IO. Disabled by default to reduce local FS heap spikes.",
+    )
     parser.add_argument("--warmup", action="store_true", help="Run one unmeasured action before timing.")
     parser.add_argument(
         "--include-method-aware",
@@ -71,29 +102,122 @@ def base_parser(description: str) -> argparse.ArgumentParser:
             "automatically when _partition_plan.json exists under --preprocessed."
         ),
     )
+    parser.add_argument(
+        "--correctness-level",
+        choices=["none", "basic", "full"],
+        default="basic",
+        help=(
+            "Correctness checks after timing. basic compares row/result counts; "
+            "full also runs expensive group/join checksum checks."
+        ),
+    )
     return parser
 
 
+def verify_java_runtime() -> None:
+    completed = subprocess.run(
+        ["java", "-version"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    output = "\n".join(part for part in [completed.stdout, completed.stderr] if part)
+    if completed.returncode != 0:
+        raise SystemExit(
+            "Cannot run `java -version`. Install JDK 17 and make sure java is on PATH."
+        )
+
+    major = parse_java_major(output)
+    if major is not None and major > 21:
+        raise SystemExit(
+            "Unsupported Java runtime for Spark/Hadoop: detected Java "
+            f"{major}. The benchmark scripts should be run with JDK 17. "
+            "Set it in the current shell, for example:\n"
+            "  export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64\n"
+            '  export PATH="$JAVA_HOME/bin:$PATH"'
+        )
+
+
+def parse_java_major(version_output: str) -> int | None:
+    match = re.search(r'version "([^"]+)"', version_output)
+    if match is None:
+        return None
+
+    version = match.group(1)
+    if version.startswith("1."):
+        parts = version.split(".")
+        return int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
+
+    major = version.split(".", maxsplit=1)[0].split("-", maxsplit=1)[0]
+    return int(major) if major.isdigit() else None
+
+
+def bool_string(value: bool) -> str:
+    return "true" if value else "false"
+
+
 def run_from_args(args: argparse.Namespace, workload_override: str | None = None) -> list[BenchmarkResult]:
+    verify_java_runtime()
     spark = (
         SparkSession.builder.appName(args.app_name)
+        .config("spark.driver.memory", args.driver_memory)
+        .config("spark.executor.memory", args.executor_memory)
         .config("spark.sql.shuffle.partitions", str(args.shuffle_partitions))
+        .config("spark.sql.autoBroadcastJoinThreshold", str(args.auto_broadcast_threshold_bytes))
+        .config("spark.sql.adaptive.enabled", "true" if args.enable_aqe else "false")
+        .config("spark.sql.parquet.columnarReaderBatchSize", str(args.parquet_batch_size))
+        .config("spark.sql.parquet.enableVectorizedReader", bool_string(args.enable_vectorized_parquet))
+        .config("spark.hadoop.parquet.hadoop.vectored.io.enabled", bool_string(args.enable_vectored_io))
         .getOrCreate()
     )
     try:
-        workload = workload_override or args.workload
-        workloads = ["group_by", "join"] if workload == "all" else [workload]
-        partition_plan = read_partition_plan(args.preprocessed)
-        manifest = read_manifest(args.preprocessed)
-        preprocessed_data_path = resolve_preprocessed_data_path(args.preprocessed, manifest)
-        input_reused = bool(manifest.get("input_reused", False)) if manifest else False
-        original = spark.read.parquet(str(args.original))
-        preprocessed = spark.read.parquet(str(preprocessed_data_path))
-        right = prepare_join_right(spark, original, args.join_right, args.key_column)
+        return run_with_spark(spark, args, workload_override=workload_override)
+    finally:
+        spark.stop()
 
+
+def run_with_spark(
+    spark: SparkSession,
+    args: argparse.Namespace,
+    workload_override: str | None = None,
+) -> list[BenchmarkResult]:
+    workload = workload_override or args.workload
+    workloads = ["scan", "filter", "group_by", "join"] if workload == "all" else [workload]
+    partition_plan = read_partition_plan(args.preprocessed)
+    manifest = read_manifest(args.preprocessed)
+    preprocessed_data_path = resolve_preprocessed_data_path(args.preprocessed, manifest)
+    input_reused = bool(manifest.get("input_reused", False)) if manifest else False
+    original = spark.read.parquet(str(args.original))
+    preprocessed = spark.read.parquet(str(preprocessed_data_path))
+    right = prepare_join_right(spark, original, args.join_right, args.key_column)
+
+    try:
         results: list[BenchmarkResult] = []
         for workload_name in workloads:
-            if workload_name == "group_by":
+            if workload_name == "scan":
+                results.extend(
+                    run_scan_benchmark(
+                        spark,
+                        original,
+                        preprocessed,
+                        original_path=args.original,
+                        preprocessed_path=args.preprocessed,
+                        warmup=args.warmup,
+                    )
+                )
+            elif workload_name == "filter":
+                results.extend(
+                    run_filter_benchmark(
+                        spark,
+                        original,
+                        preprocessed,
+                        original_path=args.original,
+                        preprocessed_path=args.preprocessed,
+                        key_column=args.key_column,
+                        warmup=args.warmup,
+                    )
+                )
+            elif workload_name == "group_by":
                 results.extend(
                     run_group_by_benchmark(
                         spark,
@@ -105,6 +229,7 @@ def run_from_args(args: argparse.Namespace, workload_override: str | None = None
                         partition_plan=partition_plan,
                         include_method_aware=(args.include_method_aware or partition_plan is not None)
                         and not input_reused,
+                        correctness_level=args.correctness_level,
                         warmup=args.warmup,
                     )
                 )
@@ -121,6 +246,7 @@ def run_from_args(args: argparse.Namespace, workload_override: str | None = None
                         partition_plan=partition_plan,
                         include_method_aware=(args.include_method_aware or partition_plan is not None),
                         input_reused=input_reused,
+                        correctness_level=args.correctness_level,
                         warmup=args.warmup,
                     )
                 )
@@ -130,7 +256,163 @@ def run_from_args(args: argparse.Namespace, workload_override: str | None = None
         write_reports(results, args.json_report, args.csv_report)
         return results
     finally:
-        spark.stop()
+        try:
+            right.unpersist(blocking=False)
+            spark.catalog.clearCache()
+        except Exception:
+            pass
+
+
+def run_scan_benchmark(
+    spark: SparkSession,
+    original: DataFrame,
+    preprocessed: DataFrame,
+    *,
+    original_path: Path,
+    preprocessed_path: Path,
+    warmup: bool,
+) -> list[BenchmarkResult]:
+    if warmup:
+        original.limit(1).count()
+    baseline = run_scan(
+        spark,
+        original,
+        mode="baseline",
+        dataset_label="original",
+        dataset_path=original_path,
+    )
+
+    if warmup:
+        preprocessed.limit(1).count()
+    physical_only = run_scan(
+        spark,
+        preprocessed,
+        mode="physical_only",
+        dataset_label="preprocessed",
+        dataset_path=preprocessed_path,
+    )
+    physical_only.correctness = correctness_against_baseline(physical_only, baseline)
+    baseline.correctness = correctness_against_baseline(baseline, baseline)
+    return [baseline, physical_only]
+
+
+def run_filter_benchmark(
+    spark: SparkSession,
+    original: DataFrame,
+    preprocessed: DataFrame,
+    *,
+    original_path: Path,
+    preprocessed_path: Path,
+    key_column: str,
+    warmup: bool,
+) -> list[BenchmarkResult]:
+    if warmup:
+        original.select(key_column).limit(1).count()
+    baseline = run_filter(
+        spark,
+        original,
+        mode="baseline",
+        dataset_label="original",
+        dataset_path=original_path,
+        key_column=key_column,
+    )
+
+    if warmup:
+        preprocessed.select(key_column).limit(1).count()
+    physical_only = run_filter(
+        spark,
+        preprocessed,
+        mode="physical_only",
+        dataset_label="preprocessed",
+        dataset_path=preprocessed_path,
+        key_column=key_column,
+    )
+    physical_only.correctness = correctness_against_baseline(physical_only, baseline)
+    baseline.correctness = correctness_against_baseline(baseline, baseline)
+    return [baseline, physical_only]
+
+
+def run_scan(
+    spark: SparkSession,
+    dataframe: DataFrame,
+    *,
+    mode: str,
+    dataset_label: str,
+    dataset_path: Path,
+) -> BenchmarkResult:
+    def action() -> dict:
+        work_columns = numeric_work_columns(dataframe)
+        row = dataframe.agg(
+            F.count(F.lit(1)).alias("rows"),
+            *sum_aggregations(work_columns),
+        ).collect()[0]
+        return {
+            "rows": int(row["rows"] or 0),
+            "work_checksum": checksum_from_row(row, work_columns),
+            "work_columns": work_columns,
+        }
+
+    elapsed, metrics = timed(action)
+    return BenchmarkResult(
+        workload="scan",
+        mode=mode,
+        dataset_label=dataset_label,
+        dataset_path=str(dataset_path),
+        elapsed_seconds=elapsed,
+        rows=metrics["rows"],
+        result_rows=metrics["rows"],
+        partitions=dataframe.rdd.getNumPartitions(),
+        spark_app_id=spark.sparkContext.applicationId,
+        correctness={},
+        extra={
+            "operation": "count_and_payload_sums",
+            "work_columns": metrics["work_columns"],
+            "work_checksum": metrics["work_checksum"],
+        },
+    )
+
+
+def run_filter(
+    spark: SparkSession,
+    dataframe: DataFrame,
+    *,
+    mode: str,
+    dataset_label: str,
+    dataset_path: Path,
+    key_column: str,
+) -> BenchmarkResult:
+    def action() -> dict:
+        filtered = dataframe.filter(F.pmod(F.xxhash64(F.col(key_column)), F.lit(10)) == F.lit(0))
+        work_columns = numeric_work_columns(filtered)
+        row = filtered.agg(
+            F.count(F.lit(1)).alias("rows"),
+            *sum_aggregations(work_columns),
+        ).collect()[0]
+        return {
+            "rows": int(row["rows"] or 0),
+            "work_checksum": checksum_from_row(row, work_columns),
+            "work_columns": work_columns,
+        }
+
+    elapsed, metrics = timed(action)
+    return BenchmarkResult(
+        workload="filter",
+        mode=mode,
+        dataset_label=dataset_label,
+        dataset_path=str(dataset_path),
+        elapsed_seconds=elapsed,
+        rows=metrics["rows"],
+        result_rows=metrics["rows"],
+        partitions=dataframe.rdd.getNumPartitions(),
+        spark_app_id=spark.sparkContext.applicationId,
+        correctness={},
+        extra={
+            "predicate": "pmod(xxhash64(key), 10) == 0",
+            "operation": "filter_count_and_payload_sums",
+            "work_columns": metrics["work_columns"],
+            "work_checksum": metrics["work_checksum"],
+        },
+    )
 
 
 def run_group_by_benchmark(
@@ -143,6 +425,7 @@ def run_group_by_benchmark(
     key_column: str,
     partition_plan: dict | None,
     include_method_aware: bool,
+    correctness_level: str,
     warmup: bool,
 ) -> list[BenchmarkResult]:
     if warmup:
@@ -168,22 +451,29 @@ def run_group_by_benchmark(
     )
 
     results = [baseline, physical_only]
-    baseline_grouped = group_by_result(original, key_column).cache()
-    physical_grouped = group_by_result(preprocessed, key_column).cache()
-    baseline.correctness = group_by_correctness_against_baseline(
-        baseline,
-        baseline,
-        baseline_grouped,
-        baseline_grouped,
-        key_column,
-    )
-    physical_only.correctness = group_by_correctness_against_baseline(
-        physical_only,
-        baseline,
-        baseline_grouped,
-        physical_grouped,
-        key_column,
-    )
+    if correctness_level == "none":
+        baseline.correctness = {}
+        physical_only.correctness = {}
+    elif correctness_level == "basic":
+        baseline.correctness = correctness_against_baseline(baseline, baseline)
+        physical_only.correctness = correctness_against_baseline(physical_only, baseline)
+    else:
+        baseline_grouped = group_by_result(original, key_column)
+        physical_grouped = group_by_result(preprocessed, key_column)
+        baseline.correctness = group_by_correctness_against_baseline(
+            baseline,
+            baseline,
+            baseline_grouped,
+            baseline_grouped,
+            key_column,
+        )
+        physical_only.correctness = group_by_correctness_against_baseline(
+            physical_only,
+            baseline,
+            baseline_grouped,
+            physical_grouped,
+            key_column,
+        )
     if include_method_aware:
         partition_column = resolve_method_aware_partition_column(preprocessed, partition_plan)
         salt_column = resolve_method_aware_salt_column(preprocessed, partition_plan)
@@ -208,18 +498,23 @@ def run_group_by_benchmark(
             partial_group_keys=partial_group_keys,
             method_aware_extra=method_aware_extra,
         )
-        method_aware_grouped = method_aware_group_by_result(
-            preprocessed,
-            key_column=key_column,
-            partial_group_keys=partial_group_keys,
-        )
-        method_aware.correctness = group_by_correctness_against_baseline(
-            method_aware,
-            baseline,
-            baseline_grouped,
-            method_aware_grouped,
-            key_column,
-        )
+        if correctness_level == "none":
+            method_aware.correctness = {}
+        elif correctness_level == "basic":
+            method_aware.correctness = correctness_against_baseline(method_aware, baseline)
+        else:
+            method_aware_grouped = method_aware_group_by_result(
+                preprocessed,
+                key_column=key_column,
+                partial_group_keys=partial_group_keys,
+            )
+            method_aware.correctness = group_by_correctness_against_baseline(
+                method_aware,
+                baseline,
+                baseline_grouped,
+                method_aware_grouped,
+                key_column,
+            )
         results.append(method_aware)
 
     return results
@@ -237,6 +532,7 @@ def run_join_benchmark(
     partition_plan: dict | None,
     include_method_aware: bool,
     input_reused: bool,
+    correctness_level: str,
     warmup: bool,
 ) -> list[BenchmarkResult]:
     if warmup:
@@ -264,22 +560,29 @@ def run_join_benchmark(
     )
 
     results = [baseline, physical_only]
-    baseline_joined = join_result(original, right, key_column).cache()
-    physical_joined = join_result(preprocessed, right, key_column).cache()
-    baseline.correctness = join_correctness_against_baseline(
-        baseline,
-        baseline,
-        baseline_joined,
-        baseline_joined,
-        key_column,
-    )
-    physical_only.correctness = join_correctness_against_baseline(
-        physical_only,
-        baseline,
-        baseline_joined,
-        physical_joined,
-        key_column,
-    )
+    if correctness_level == "none":
+        baseline.correctness = {}
+        physical_only.correctness = {}
+    elif correctness_level == "basic":
+        baseline.correctness = correctness_against_baseline(baseline, baseline)
+        physical_only.correctness = correctness_against_baseline(physical_only, baseline)
+    else:
+        baseline_joined = join_result(original, right, key_column)
+        physical_joined = join_result(preprocessed, right, key_column)
+        baseline.correctness = join_correctness_against_baseline(
+            baseline,
+            baseline,
+            baseline_joined,
+            baseline_joined,
+            key_column,
+        )
+        physical_only.correctness = join_correctness_against_baseline(
+            physical_only,
+            baseline,
+            baseline_joined,
+            physical_joined,
+            key_column,
+        )
     if include_method_aware:
         skip_reason = method_aware_join_skip_reason(
             preprocessed,
@@ -311,20 +614,25 @@ def run_join_benchmark(
                 key_column=key_column,
                 dataset_path=preprocessed_path,
             )
-            method_aware_joined = method_aware_join_result(
-                spark,
-                preprocessed,
-                right,
-                partition_plan=partition_plan or {},
-                key_column=key_column,
-            )
-            method_aware.correctness = join_correctness_against_baseline(
-                method_aware,
-                baseline,
-                baseline_joined,
-                method_aware_joined,
-                key_column,
-            )
+            if correctness_level == "none":
+                method_aware.correctness = {}
+            elif correctness_level == "basic":
+                method_aware.correctness = correctness_against_baseline(method_aware, baseline)
+            else:
+                method_aware_joined = method_aware_join_result(
+                    spark,
+                    preprocessed,
+                    right,
+                    partition_plan=partition_plan or {},
+                    key_column=key_column,
+                )
+                method_aware.correctness = join_correctness_against_baseline(
+                    method_aware,
+                    baseline,
+                    baseline_joined,
+                    method_aware_joined,
+                    key_column,
+                )
             results.append(method_aware)
 
     return results
@@ -341,15 +649,19 @@ def run_group_by(
 ) -> BenchmarkResult:
     def action() -> dict:
         grouped = group_by_result(dataframe, key_column)
+        aggregate_columns = grouped_aggregate_columns(grouped)
         row = grouped.agg(
             F.count(F.lit(1)).alias("result_rows"),
             F.sum("count").alias("rows"),
             F.max("count").alias("max_group_count"),
+            *grouped_sum_aggregations(aggregate_columns),
         ).collect()[0]
         return {
             "rows": int(row["rows"] or 0),
             "result_rows": int(row["result_rows"] or 0),
             "max_group_count": int(row["max_group_count"] or 0),
+            "work_checksum": checksum_from_row(row, aggregate_columns),
+            "work_columns": aggregate_columns,
         }
 
     elapsed, metrics = timed(action)
@@ -364,12 +676,21 @@ def run_group_by(
         partitions=dataframe.rdd.getNumPartitions(),
         spark_app_id=spark.sparkContext.applicationId,
         correctness={},
-        extra={"max_group_count": metrics["max_group_count"]},
+        extra={
+            "operation": "group_by_count_and_payload_sums",
+            "max_group_count": metrics["max_group_count"],
+            "work_columns": metrics["work_columns"],
+            "work_checksum": metrics["work_checksum"],
+        },
     )
 
 
 def group_by_result(dataframe: DataFrame, key_column: str) -> DataFrame:
-    return dataframe.groupBy(key_column).count()
+    work_columns = numeric_work_columns(dataframe)
+    return dataframe.groupBy(key_column).agg(
+        F.count(F.lit(1)).alias("count"),
+        *sum_aggregations(work_columns),
+    )
 
 
 def run_method_aware_group_by(
@@ -397,15 +718,19 @@ def run_method_aware_group_by(
             key_column=key_column,
             partial_group_keys=group_keys,
         )
+        aggregate_columns = grouped_aggregate_columns(final)
         row = final.agg(
             F.count(F.lit(1)).alias("result_rows"),
             F.sum("count").alias("rows"),
             F.max("count").alias("max_group_count"),
+            *grouped_sum_aggregations(aggregate_columns),
         ).collect()[0]
         return {
             "rows": int(row["rows"] or 0),
             "result_rows": int(row["result_rows"] or 0),
             "max_group_count": int(row["max_group_count"] or 0),
+            "work_checksum": checksum_from_row(row, aggregate_columns),
+            "work_columns": aggregate_columns,
         }
 
     elapsed, metrics = timed(action)
@@ -422,6 +747,9 @@ def run_method_aware_group_by(
         correctness={},
         extra={
             "max_group_count": metrics["max_group_count"],
+            "operation": "partial_then_final_group_by_count_and_payload_sums",
+            "work_columns": metrics["work_columns"],
+            "work_checksum": metrics["work_checksum"],
             "partition_column": partition_column,
             "salt_column": salt_column,
             "partial_group_keys": group_keys,
@@ -436,8 +764,15 @@ def method_aware_group_by_result(
     key_column: str,
     partial_group_keys: list[str],
 ) -> DataFrame:
-    partial = dataframe.groupBy(*partial_group_keys).count()
-    return partial.groupBy(key_column).agg(F.sum("count").alias("count"))
+    work_columns = numeric_work_columns(dataframe)
+    partial = dataframe.groupBy(*partial_group_keys).agg(
+        F.count(F.lit(1)).alias("count"),
+        *sum_aggregations(work_columns),
+    )
+    return partial.groupBy(key_column).agg(
+        F.sum("count").alias("count"),
+        *[F.sum(sum_alias(column)).alias(sum_alias(column)) for column in work_columns],
+    )
 
 
 def run_join(
@@ -465,7 +800,12 @@ def run_join(
         partitions=left.rdd.getNumPartitions(),
         spark_app_id=spark.sparkContext.applicationId,
         correctness={},
-        extra={"right_partitions": right.rdd.getNumPartitions()},
+        extra={
+            "operation": "join_count_distinct_and_payload_sums",
+            "right_partitions": right.rdd.getNumPartitions(),
+            "work_columns": metrics["work_columns"],
+            "work_checksum": metrics["work_checksum"],
+        },
     )
 
 
@@ -573,6 +913,8 @@ def run_method_aware_join(
             **extra,
             "right_partitions": right.rdd.getNumPartitions(),
             "right_replication_rows": metrics["right_replication_rows"],
+            "work_columns": metrics["work_columns"],
+            "work_checksum": metrics["work_checksum"],
         },
     )
 
@@ -661,13 +1003,19 @@ def salted_join_result_with_replication(
 
 
 def collect_join_metrics(joined: DataFrame, key_column: str) -> dict:
+    work_columns = numeric_work_columns(joined)
+    if "join_payload" in joined.columns:
+        work_columns.append("join_payload")
     row = joined.agg(
         F.count(F.lit(1)).alias("rows"),
         F.countDistinct(key_column).alias("result_rows"),
+        *sum_aggregations(work_columns),
     ).collect()[0]
     return {
         "rows": int(row["rows"] or 0),
         "result_rows": int(row["result_rows"] or 0),
+        "work_checksum": checksum_from_row(row, work_columns),
+        "work_columns": work_columns,
     }
 
 
@@ -713,6 +1061,84 @@ def prepare_join_right(
     return right.withColumn("join_payload", F.xxhash64(F.col(key_column))).cache()
 
 
+def numeric_work_columns(dataframe: DataFrame) -> list[str]:
+    columns = []
+    if "value" in dataframe.columns:
+        columns.append("value")
+    columns.extend(
+        sorted(
+            [column for column in dataframe.columns if re.fullmatch(r"payload_\d+", column)],
+            key=lambda column: int(column.rsplit("_", maxsplit=1)[1]),
+        )
+    )
+    return columns
+
+
+def sum_aggregations(columns: list[str]) -> list:
+    return [
+        F.sum(F.col(column).cast("decimal(38, 0)")).alias(sum_alias(column))
+        for column in columns
+    ]
+
+
+def grouped_aggregate_columns(dataframe: DataFrame) -> list[str]:
+    columns = []
+    if "value_sum" in dataframe.columns:
+        columns.append("value_sum")
+    columns.extend(
+        sorted(
+            [
+                column
+                for column in dataframe.columns
+                if re.fullmatch(r"payload_\d+_sum", column)
+            ],
+            key=lambda column: int(column.split("_")[1]),
+        )
+    )
+    return columns
+
+
+def numeric_work_columns_from_names(columns: Iterable[str]) -> list[str]:
+    selected = []
+    if "value" in columns:
+        selected.append("value")
+    selected.extend(
+        sorted(
+            [column for column in columns if re.fullmatch(r"payload_\d+", column)],
+            key=lambda column: int(column.rsplit("_", maxsplit=1)[1]),
+        )
+    )
+    return selected
+
+
+def grouped_sum_aggregations(columns: list[str]) -> list:
+    return [
+        F.sum(F.col(column).cast("decimal(38, 0)")).alias(total_alias(column))
+        for column in columns
+    ]
+
+
+def checksum_from_row(row, columns: list[str]) -> int:
+    values = row.asDict()
+    total = 0
+    for column in columns:
+        value = (
+            values.get(sum_alias(column))
+            if not column.endswith("_sum")
+            else values.get(total_alias(column))
+        )
+        total += int(value or 0)
+    return total
+
+
+def sum_alias(column: str) -> str:
+    return f"{column}_sum"
+
+
+def total_alias(column: str) -> str:
+    return f"{column}_total"
+
+
 def timed(action: Callable[[], dict]) -> tuple[float, dict]:
     started = time.perf_counter()
     result = action()
@@ -745,7 +1171,11 @@ def group_by_correctness_against_baseline(
         checksum_comparison(
             baseline_grouped,
             candidate_grouped,
-            checksum_columns=[key_column, "count"],
+            checksum_columns=comparable_group_by_checksum_columns(
+                baseline_grouped,
+                candidate_grouped,
+                key_column,
+            ),
         )
     )
     return correctness
@@ -821,7 +1251,7 @@ def checksum_comparison(
 def dataframe_checksum(dataframe: DataFrame, columns: list[str]) -> int:
     selected_columns = [F.col(column).cast("string") for column in columns]
     row = dataframe.select(F.xxhash64(*selected_columns).alias("h")).agg(
-        F.sum("h").alias("checksum")
+        F.sum(F.col("h").cast("decimal(38, 0)")).alias("checksum")
     ).collect()[0]
     return int(row["checksum"] or 0)
 
@@ -836,6 +1266,24 @@ def comparable_join_checksum_columns(
         candidate.columns,
         key_column,
     )
+
+
+def comparable_group_by_checksum_columns(
+    baseline: DataFrame,
+    candidate: DataFrame,
+    key_column: str,
+) -> list[str]:
+    baseline_columns = set(baseline.columns)
+    candidate_columns = set(candidate.columns)
+    columns = [key_column, "count"]
+    columns.extend(
+        sorted(
+            column
+            for column in baseline_columns & candidate_columns
+            if column == "value_sum" or re.fullmatch(r"payload_\d+_sum", column)
+        )
+    )
+    return [column for column in columns if column in baseline_columns and column in candidate_columns]
 
 
 def comparable_join_checksum_column_names(
@@ -1284,9 +1732,11 @@ def write_reports(results: Iterable[BenchmarkResult], json_report: Path, csv_rep
 
 
 def benchmark_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    scan = results_by_workload_and_mode(rows, "scan")
+    filter_results = results_by_workload_and_mode(rows, "filter")
     group_by = results_by_workload_and_mode(rows, "group_by")
     join = results_by_workload_and_mode(rows, "join")
-    active = group_by or join
+    active = scan or filter_results or group_by or join
 
     active_method_aware = active.get("method_aware")
     join_method_aware = join.get("method_aware")

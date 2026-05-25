@@ -1,8 +1,8 @@
 use std::{process::ExitCode, time::Instant};
 
 use repartitioner::{
-    cli::CliArgs, manifest::TimingMetadata, partitioner, planner, reader, statistics, writer,
-    Result,
+    cli::CliArgs, config::DatasetFormat, manifest::TimingMetadata, partitioner, planner, reader,
+    statistics, writer, Result,
 };
 
 fn main() -> ExitCode {
@@ -20,14 +20,27 @@ fn run(args: CliArgs) -> Result<()> {
     let mut config = args.load_config()?;
     apply_join_inputs(&mut config);
 
-    let read_started = Instant::now();
-    let dataset = reader::read_dataset(&config)?;
-    let read_seconds = elapsed_seconds(read_started);
+    let streaming_statistics = statistics::can_use_streaming_statistics(&config);
+    let (dataset, mut statistics, read_seconds, statistics_seconds) = if streaming_statistics {
+        let statistics_started = Instant::now();
+        let (dataset, statistics) = statistics::compute_parquet_statistics_streaming(&config)?;
+        (
+            dataset,
+            statistics,
+            0.0,
+            elapsed_seconds(statistics_started),
+        )
+    } else {
+        let read_started = Instant::now();
+        let dataset = reader::read_dataset(&config)?;
+        let read_seconds = elapsed_seconds(read_started);
 
-    let statistics_started = Instant::now();
-    let mut statistics = statistics::compute_statistics(&config, &dataset)?;
+        let statistics_started = Instant::now();
+        let statistics = statistics::compute_statistics(&config, &dataset)?;
+        let statistics_seconds = elapsed_seconds(statistics_started);
+        (dataset, statistics, read_seconds, statistics_seconds)
+    };
     attach_join_statistics(&config, &mut statistics)?;
-    let statistics_seconds = elapsed_seconds(statistics_started);
 
     let planning_started = Instant::now();
     let plan = planner::build_plan(&config, &statistics)?;
@@ -63,19 +76,50 @@ fn run(args: CliArgs) -> Result<()> {
     }
 
     let assignment_started = Instant::now();
-    let assignments = partitioner::assign_partitions(&plan, &dataset)?;
+    let assignments = if streaming_statistics && config.output.format == DatasetFormat::Parquet {
+        None
+    } else {
+        Some(partitioner::assign_partitions_with_threads(
+            &plan,
+            &dataset,
+            config.resources.local_threads,
+        )?)
+    };
     let assignment_seconds = elapsed_seconds(assignment_started);
-    statistics.set_after_partition_sizes(assignments.partition_row_counts.clone());
+
+    if let Some(assignments) = &assignments {
+        statistics.set_after_partition_sizes(assignments.partition_row_counts.clone());
+    }
 
     let writing_started = Instant::now();
-    let write_summary = writer::write_output(
-        &config.output.path,
-        &config.output.format,
-        &plan.metadata,
-        &statistics.metadata,
-        &assignments,
-        &dataset,
-    )?;
+    let write_summary = if let Some(assignments) = &assignments {
+        writer::write_output(
+            &config.output.path,
+            &config.output.format,
+            &plan.metadata,
+            &statistics.metadata,
+            assignments,
+            &dataset,
+        )?
+    } else {
+        writer::write_output_streaming_assignments(
+            &config.output.path,
+            &config.output.format,
+            &plan.metadata,
+            &statistics.metadata,
+            &dataset,
+        )?
+    };
+    if assignments.is_none() {
+        statistics.set_after_partition_sizes(
+            write_summary
+                .manifest
+                .partitions
+                .iter()
+                .map(|partition| partition.row_count)
+                .collect(),
+        );
+    }
     let writing_seconds = elapsed_seconds(writing_started);
     statistics.set_timing(TimingMetadata {
         read_seconds,
@@ -127,8 +171,12 @@ fn attach_join_statistics(
     let mut right_config = config.clone();
     right_config.dataset.input = join_config.right_input.clone();
     right_config.partitioning.key_columns = join_config.join_keys.clone();
-    let right_dataset = reader::read_dataset(&right_config)?;
-    let right_statistics = statistics::compute_statistics(&right_config, &right_dataset)?;
+    let right_statistics = if statistics::can_use_streaming_statistics(&right_config) {
+        statistics::compute_parquet_statistics_streaming(&right_config)?.1
+    } else {
+        let right_dataset = reader::read_dataset(&right_config)?;
+        statistics::compute_statistics(&right_config, &right_dataset)?
+    };
     computed_statistics.set_join_statistics(statistics::build_join_statistics(
         join_config.join_keys.clone(),
         computed_statistics,

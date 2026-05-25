@@ -12,7 +12,7 @@ impl ExecutionResources {
         Self {
             local_threads: config.resources.local_threads.max(1),
             memory_limit_mb: config.resources.memory_limit_mb,
-            parallel_execution_enabled: false,
+            parallel_execution_enabled: config.resources.local_threads > 1,
         }
     }
 

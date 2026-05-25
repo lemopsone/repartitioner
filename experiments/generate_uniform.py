@@ -18,7 +18,14 @@ def main() -> None:
         user_ids = balanced_uniform_keys(args.rows, args.key_cardinality, args.seed)
     else:
         user_ids = uniform_keys(args.rows, args.key_cardinality, args.seed)
-    metadata = write_dataset(args.output, user_ids, args.scenario_name, args.seed)
+    metadata = write_dataset(
+        args.output,
+        user_ids,
+        args.scenario_name,
+        args.seed,
+        part_rows=args.part_rows,
+        payload_columns=args.payload_columns,
+    )
     metadata["key_cardinality"] = args.key_cardinality
     metadata["balanced"] = args.balanced
     print_metadata(metadata)

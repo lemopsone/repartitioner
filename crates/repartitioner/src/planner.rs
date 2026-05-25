@@ -304,6 +304,10 @@ fn rewrite_decision(
         return rewrite("force_rewrite");
     }
 
+    if matches!(config.job.job_type, JobType::Scan | JobType::Filter) {
+        return no_rewrite("downstream_operator_not_skew_sensitive");
+    }
+
     if !heavy_keys.is_empty() {
         return rewrite("heavy_keys_detected");
     }
@@ -417,7 +421,7 @@ fn recommended_downstream_plan(
     let (strategy, requires_operator_rewrite, partial_group_keys, final_group_keys, join_keys) =
         match &config.job.job_type {
             JobType::Scan => (
-                "physical_repartitioning",
+                "input_reuse_no_op",
                 false,
                 Vec::new(),
                 Vec::new(),
@@ -425,8 +429,9 @@ fn recommended_downstream_plan(
             ),
             JobType::Filter => {
                 notes.push("filter_selectivity_unknown".to_string());
+                notes.push("filter_no_key_shuffle".to_string());
                 (
-                    "physical_repartitioning_with_filter_awareness",
+                    "input_reuse_no_op",
                     false,
                     Vec::new(),
                     Vec::new(),
@@ -1459,12 +1464,14 @@ mod tests {
 
         let recommendation = &plan.metadata.recommended_downstream_plan;
         assert_eq!(plan.metadata.job_type, crate::config::JobType::Scan);
-        assert_eq!(recommendation.strategy, "physical_repartitioning");
-        assert!(!recommendation.requires_operator_rewrite);
+        assert_eq!(plan.metadata.action, PlanAction::NoOp);
+        assert!(!plan.metadata.rewrite_required);
         assert_eq!(
-            recommendation.partition_column.as_deref(),
-            Some("_rp_partition_id")
+            plan.metadata.skip_reason.as_deref(),
+            Some("downstream_operator_not_skew_sensitive")
         );
+        assert_eq!(recommendation.strategy, "input_reuse_no_op");
+        assert!(!recommendation.requires_operator_rewrite);
     }
 
     #[test]
@@ -1473,14 +1480,20 @@ mod tests {
         let plan = build_plan_for_job_config(&config);
 
         let recommendation = &plan.metadata.recommended_downstream_plan;
+        assert_eq!(plan.metadata.action, PlanAction::NoOp);
+        assert!(!plan.metadata.rewrite_required);
         assert_eq!(
-            recommendation.strategy,
-            "physical_repartitioning_with_filter_awareness"
+            plan.metadata.skip_reason.as_deref(),
+            Some("downstream_operator_not_skew_sensitive")
         );
+        assert_eq!(recommendation.strategy, "input_reuse_no_op");
         assert!(!recommendation.requires_operator_rewrite);
         assert!(recommendation
             .notes
             .contains(&"filter_selectivity_unknown".to_string()));
+        assert!(recommendation
+            .notes
+            .contains(&"filter_no_key_shuffle".to_string()));
     }
 
     fn config_with_partition_limits(
