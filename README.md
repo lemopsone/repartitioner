@@ -74,8 +74,28 @@ Legacy-конфиги с `dataset.output` и `dataset.format` остаются �
 cargo fmt --check
 cargo test
 cargo build -p repartitioner
-.venv/bin/python -m compileall experiments spark_pipeline datasets
+.venv/bin/python -m compileall experiments spark_pipeline datasets gui
 ```
+
+## Графический интерфейс
+
+Для запуска GUI сначала соберите Rust-ядро:
+
+```bash
+cargo build -p repartitioner --release
+```
+
+Затем запустите интерфейс:
+
+```bash
+python3 gui/repartitioner_gui.py
+```
+
+Интерфейс позволяет выбрать входной dataset и выходную директорию, задать
+ключевые колонки и параметры adaptive hash salting, выполнить предобработку и
+просмотреть созданные файлы, ключевые статистики, план партиционирования,
+manifest и полный JSON metadata. GUI не содержит функций генерации dataset,
+запуска Spark-заданий или проведения benchmark-замеров.
 
 Дополнительные материалы:
 

@@ -6,3 +6,4 @@ __pycache__/
 *.py[cod]
 trial_runs/
 data/*
+.gui_runs/
